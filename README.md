@@ -26,3 +26,7 @@ pip install numpy matplotlib pillow
 
 # 运行仿真
 python pollution_monitoring.py
+
+# 输出效果
+
+
