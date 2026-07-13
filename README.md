@@ -27,6 +27,8 @@ pip install numpy matplotlib pillow
 # 运行仿真
 python pollution_monitoring.py
 
-# 输出效果
+```
+## 效果预览
+![Preview]([https://i.imgur.com/your_image.gif](https://github.com/Ginjing-Yuan/Voronoi-Pollution-Cleanup/blob/main/pollution_diffusion.gif))
 
 
