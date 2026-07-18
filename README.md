@@ -33,7 +33,7 @@ python pollution_monitoring.py
 下图展示了多智能体在风场和扩散作用下的协同清理过程。可以看到 Voronoi 边界（白色虚线）随智能体移动而动态变形，智能体根据广义质心直捣污染源头。
 
 <p align="center">
-  <img src="pollution_diffusion.gif" alt="污染清理仿真演示" width="800">
+  <img src="pollution_diffusion.gif" alt="污染清理仿真预览" width="800">
 </p>
 
 
