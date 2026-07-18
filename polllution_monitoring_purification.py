@@ -1,61 +1,158 @@
 import numpy as np  # 数值计算库，用于矩阵运算和数学函数
 import matplotlib.pyplot as plt  # 绑图库，用于生成热力图和动画
 from matplotlib.animation import FuncAnimation  # 动画类，用于逐帧更新可视化
-from matplotlib.patches import Circle  # 圆形补丁，用于绘制Agent的清理范围圆圈
-import random  # 随机数库，用于生成随机污染源位置和风场
+import random
+from matplotlib.patches import Circle, Polygon as MplPolygon
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 
-# 稳态污染分布
-INNER_MASS = 60 # 稳态污染内圈浓度
-MID_MASS = 30 # 稳态污染中圈浓度
-OUT_MASS = 10 # 稳态污染外圈浓度
+# 污染场参数（高斯混合模型）
+GAUSSIAN_NUM = 5  # 高斯源数量 N_s
+GAUSSIAN_AMPLITUDE_RANGE = (1, 3)  # 每个高斯源的振幅 A_k 范围
+GAUSSIAN_SIGMA_RANGE = (30, 30)  # 每个高斯源的扩散半径 σ_k 范围
+NOISE_LEVEL = 0.5  # 噪声水平
+
+# 对流-扩散方程参数
+DIFFUSION_COEFF = 0.25  # 扩散系数 D
+CONVECTION_VX = 0.0  # 对流速度X分量 v_x
+CONVECTION_VY = 0.0  # 对流速度Y分量 v_y
+SOURCE_STRENGTH = 0.0  # 源项强度 S
 
 # 清洁Agent参数
-CLEANING_EFFICIENCY = 30 # 单位时间清理最大值
-CLEANING_RADIUS = 5 # 清洁半径
-MOVING_SPEED = 1 # 移动速度
+NEUTRALIZATION_MAX = 1.0
+NEUTRALIZATION_DECAY = 0.0003
+LINEAR_SPEED = 1.0
+ANGULAR_SPEED = 0.15
+OVERSPRAY_THRESHOLD = 0.2
 
 # 场景模拟参数
-POLLUTION_SOURCE_NUM = 1 # 污染源数量（暂时仅做了一个）
-WIDTH = 100 # 图片宽度
-HEIGHT = 100 # 图片高度
-AGENTS_NUM = 4 # 清洁装置数量
-SENSOR_NUM = 81 # 传感器数量（传感器数量暂时固定为81）
+POLLUTION_SOURCE_NUM = GAUSSIAN_NUM
+WIDTH = 600 # 图片宽度
+HEIGHT = 600 # 图片高度
+AGENTS_NUM = 10 # 清洁装置数量
+
+# 11边形顶点坐标（论文指定）
+POLYGON_VERTICES = np.array([
+    (80, 30), (270, 10), (390, 25), (500, 120), (520, 340),
+    (510, 400), (490, 470), (200, 520), (80, 470), (25, 320), (35, 165)
+])
+
+# 离散化步长
+DX = 2  # Dx=Dy=2m
+
+def point_in_polygon(x, y, vertices):
+    """射线法判断点(x,y)是否在多边形内部"""
+    n = len(vertices)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = vertices[i]
+        xj, yj = vertices[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def create_region_mask(width, height, vertices):
+    """创建多边形区域的掩码矩阵，区域内为True"""
+    mask = np.zeros((height, width), dtype=bool)
+    for y in range(height):
+        for x in range(width):
+            if point_in_polygon(x, y, vertices):
+                mask[y, x] = True
+    return mask
+
+
+class FieldEstimator:
+    """基于高斯过程回归的连续污染场估计器"""
+
+    def __init__(self, length_scale=50.0, noise_level=1.0):
+        # 定义 GPR 核函数：常数核 * 径向基核 (RBF)
+        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale, (1e-2, 1e2))
+        self.gpr = GaussianProcessRegressor(kernel=kernel, alpha=noise_level, normalize_y=True)
+        self.estimated_field = None
+        self.grid_x = None
+        self.grid_y = None
+
+    def update_field(self, sensors, width, height, step=10):
+        """
+        根据传感器读数更新连续场估计。
+        step: 预测网格的步长，为了计算速度，不能是1（600x600太慢），建议10或20。
+        """
+        # 1. 收集训练数据 (传感器坐标和读数)
+        X_train = np.array([[s.x, s.y] for s in sensors])
+        y_train = np.array([s.readings[-1] if s.readings else 0 for s in sensors])
+
+        # 如果所有读数都是0，GPR会报错，直接返回全0场
+        if np.max(y_train) < 1e-5:
+            self.estimated_field = np.zeros((height, width))
+            return
+
+        # 2. 拟合 GPR 模型
+        self.gpr.fit(X_train, y_train)
+
+        # 3. 生成预测网格 (降采样以加速)
+        y_grid, x_grid = np.mgrid[0:height:step, 0:width:step]
+        X_test = np.vstack([x_grid.ravel(), y_grid.ravel()]).T
+
+        # 4. 预测连续场
+        y_pred = self.gpr.predict(X_test)
+
+        # 将预测结果重塑为网格，并放大回原分辨率 (最近邻插值)
+        low_res_field = y_pred.reshape(x_grid.shape)
+        self.estimated_field = np.repeat(np.repeat(low_res_field, step, axis=0), step, axis=1)
+        # 裁剪到实际宽高
+        self.estimated_field = self.estimated_field[:height, :width]
+
 
 class PollutionEnvironment:
     """污染环境类：管理污染网格、污染源、扩散和清理逻辑"""
-    def __init__(self, width=100, height=100, diffusion_rate=50, decay_rate=0,
-                 source_mass=1000, diffusion_mass=1,
-                 min_concentration=1, diffusion_mode='steady'):
-        self.width = width  # 网格宽度（列数）
-        self.height = height  # 网格高度（行数）
-        self.diffusion_rate = diffusion_rate  # 每圈扩散的总质量（瞬态模式用）
-        # self.decay_rate = decay_rate  # 自降解速率：每帧浓度衰减比例
-        self.min_concentration = min_concentration  # 最小浓度阈值：低于此值的格子视为无污染
-        self.source_mass = source_mass  # 污染源中心质量/浓度（瞬态模式用）
+    def __init__(self, width=WIDTH, height=HEIGHT, diffusion_mode='steady'):
+        self.width = width
+        self.height = height
 
-        self.diffusion_mode = diffusion_mode  # 扩散模式：'steady'稳态 / 'transient'瞬态
-        self.pollution_grid = np.zeros((height, width))  # 污染浓度网格，初始化全0
-        self.wind_x = 0  # 风场X方向分量(风场暂时未生效)
-        self.wind_y = 0  # 风场Y方向分量(风场暂时未生效)
-        self.wind_change_interval = 50  # 风场变化间隔帧数(风场暂时未生效)
-        self.pollution_sources = []  # 污染源列表，每个元素为字典{x, y, concentration, radius, active}
-        self.current_ring = 0  # 当前已扩散到的圈数（瞬态模式用）
+        self.diffusion_mode = diffusion_mode
+        self.pollution_grid = np.zeros((height, width))
+        self.pollution_sources = []
+        self.initialized = False
 
-        self.initialized = False  # 稳态模式是否已完成初始分布的标志
+        # 11边形区域掩码
+        print("正在生成11边形区域掩码...")
+        self.region_mask = create_region_mask(width, height, POLYGON_VERTICES)
+        print(f"区域掩码生成完成，区域内格子数: {np.sum(self.region_mask)}")
 
-    def add_pollution_source(self, x, y, concentration=INNER_MASS, radius=0):
-        """添加污染源：记录源信息并在网格中心点赋初值"""
-        self.pollution_sources.append({
-            'x': x, 'y': y, 'concentration': concentration,  # 源坐标和浓度
-            'radius': radius, 'active': True  # 源半径和是否活跃标志
-        })
-        self.pollution_grid[y, x] = concentration  # 在网格中心点设置初始浓度
+    def generate_gmm_field(self):
+        """
+        用高斯混合模型生成初始污染场：
+        φ(x,y) = Σ A_k * exp(-((x-x_k)² + (y-y_k)²) / (2σ_k²)) + Noise
+        污染源位置在11边形区域内随机生成
+        """
+        self.pollution_sources = []
+        for _ in range(GAUSSIAN_NUM):
+            while True:
+                x = random.randint(40, self.width - 40)
+                y = random.randint(40, self.height - 40)
+                if self.region_mask[y, x]:
+                    # 如果不控制污染源点之间的距离可直接break
+                    # break
+                    # 如果想保证污染源直接不出现重合 可以设置下方条件保证污染源直接的间距
+                    if all(np.sqrt((x - s['x'])**2 + (y - s['y'])**2) >= 40 for s in self.pollution_sources):
+                        break
+            A_k = random.uniform(*GAUSSIAN_AMPLITUDE_RANGE)
+            sigma_k = random.uniform(*GAUSSIAN_SIGMA_RANGE)
+            self.pollution_sources.append({'x': x, 'y': y, 'amplitude': A_k, 'sigma': sigma_k})
 
-    def update_wind(self, frame):
-        """每隔wind_change_interval帧随机更新风场方向"""
-        if frame % self.wind_change_interval == 0:  # 到达变化间隔时
-            self.wind_x = random.uniform(-2, 2)  # 随机生成X方向风速，范围[-2, 2]
-            self.wind_y = random.uniform(-2, 2)  # 随机生成Y方向风速，范围[-2, 2]
+        yy, xx = np.mgrid[0:self.height, 0:self.width]
+        field = np.zeros((self.height, self.width))
+        for src in self.pollution_sources:
+            dx = xx - src['x']
+            dy = yy - src['y']
+            field += src['amplitude'] * np.exp(-(dx ** 2 + dy ** 2) / (2 * src['sigma'] ** 2))
+        field += np.random.normal(0, NOISE_LEVEL, (self.height, self.width))
+        field[~self.region_mask] = 0
+        field = np.maximum(field, 0)
+        self.pollution_grid = field
 
     def diffuse(self):
         """扩散入口：根据扩散模式选择对应的扩散方法"""
@@ -68,122 +165,16 @@ class PollutionEnvironment:
         elif self.diffusion_mode == 'transient':  # 瞬态模式
             self._diffuse_transient()  # 每帧重新计算扩散分布
 
-    # 内嵌函数：Bresenham画圆算法计算环带点
-    def get_ring_points(self, r_outer, r_inner, source_x, source_y, width, height):
-        inner_points = set()  # 内圈点集合
-        outer_points = set()  # 外圈点集合
-
-        x_inner = r_inner  # 内圈当前x
-        y_inner = 0  # 内圈当前y
-        err_inner = 1 - r_inner  # 内圈决策参数
-
-        x_outer = r_outer  # 外圈当前x
-        y_outer = 0  # 外圈当前y
-        err_outer = 1 - r_outer  # 外圈决策参数
-
-        while x_inner >= y_inner:  # Bresenham遍历内圈
-            pts = [  # 内圈8个对称点
-                (source_x + x_inner, source_y + y_inner), (source_x - x_inner, source_y + y_inner),
-                (source_x + x_inner, source_y - y_inner), (source_x - x_inner, source_y - y_inner),
-                (source_x + y_inner, source_y + x_inner), (source_x - y_inner, source_y + x_inner),
-                (source_x + y_inner, source_y - y_inner), (source_x - y_inner, source_y - x_inner)
-            ]
-            for px, py in pts:  # 收集内圈点
-                if 0 <= px < self.width and 0 <= py < self.height:
-                    inner_points.add((px, py))
-            y_inner += 1
-            if err_inner < 0:
-                err_inner += 2 * y_inner + 1
-            else:
-                x_inner -= 1
-                err_inner += 2 * (y_inner - x_inner) + 1
-
-        while x_outer >= y_outer:  # Bresenham遍历外圈
-            pts = [  # 外圈8个对称点
-                (source_x + x_outer, source_y + y_outer), (source_x - x_outer, source_y + y_outer),
-                (source_x + x_outer, source_y - y_outer), (source_x - x_outer, source_y - y_outer),
-                (source_x + y_outer, source_y + x_outer), (source_x - y_outer, source_y + x_outer),
-                (source_x + y_outer, source_y - x_outer), (source_x - y_outer, source_y - x_outer)
-            ]
-
-            fill_pts = [  # 内外圈之间的填充点
-                (source_x + x_outer - 1, source_y + y_outer), (source_x - x_outer + 1, source_y + y_outer),
-                (source_x + x_outer - 1, source_y - y_outer), (source_x - x_outer + 1, source_y - y_outer),
-                (source_x + y_outer, source_y + x_outer - 1), (source_x - y_outer, source_y + x_outer - 1),
-                (source_x + y_outer, source_y - x_outer + 1), (source_x - y_outer, source_y - x_outer + 1)
-            ]
-            fill_points = []  # 未使用
-            if (source_x + x_outer - 1, source_y + y_outer) not in inner_points:  # 填充点不在内圈时加入
-                for px, py in fill_pts:
-                    if 0 <= px < width and 0 <= py < height:
-                        outer_points.add((px, py))
-            for px, py in pts:  # 收集外圈点
-                if 0 <= px < width and 0 <= py < height:
-                    outer_points.add((px, py))
-            y_outer += 1
-            if err_outer < 0:
-                err_outer += 2 * y_outer + 1
-            else:
-                x_outer -= 1
-                err_outer += 2 * (y_outer - x_outer) + 1
-        return list(outer_points)
-
     def _diffuse_transient(self):
-        """
-        瞬态扩散：总量守恒，污染物随时间从中心向外摊开
-        圆心浓度为source_mass，每帧向外扩散diffusion_mass
-        """
-        self.current_ring += 1  # 当前扩散圈数递增
-        grid = self.pollution_grid  # 引用当前网格
-
-        for source in self.pollution_sources:  # 遍历每个污染源
-            cx, cy = int(source['x']), int(source['y'])  # 源中心坐标
-
-            grid[cx, cy] = self.source_mass  # 设置源中心浓度为source_mass
-
-            for current_radius in range(1, self.current_ring + 1):  # 从半径1逐圈向外扩散
-                ring_points = self.get_ring_points(current_radius, current_radius - 1, cx, cy, self.width, self.height)  # 获取当前环的点
-                if not ring_points:  # 如果环上没有有效点则跳过
-                    break
-
-                ring_mass = self.diffusion_rate / len(ring_points) if len(ring_points) > 0 else 0  # 每个格子分到的质量
-
-                for px, py in ring_points:  # 将质量分配到环上每个格子
-                    grid[py, px] += ring_mass
-
-        self.pollution_grid = grid  # 更新网格
+        """瞬态模式暂未实现，预留接口"""
+        pass
 
     def _diffuse_steady(self):
         """
-        稳态扩散初始化：源头浓度不变，周围按固定分布生成
-        只在首次调用时执行，生成稳态分布
-        污染物浓度分布暂时固定
+        稳态扩散初始化：用高斯混合模型生成初始污染场
+        只在首次调用时执行
         """
-        grid = self.pollution_grid  # 引用当前网格
-
-        for source in self.pollution_sources:  # 遍历每个污染源
-            cx, cy = int(source['x']), int(source['y'])  # 源中心坐标
-
-            grid[cx, cy] = self.source_mass  # 设置源中心浓度
-
-            for current_radius in range(1, 30):  # 从半径1扩散到30圈
-                ring_points = self.get_ring_points(current_radius, current_radius - 1, cx, cy, self.width, self.height)  # 获取环带点
-                if not ring_points:  # 无有效点则停止
-                    break
-
-                # 稳态浓度：按距离分段设定固定浓度值
-                ring_mass = INNER_MASS  # 默认浓度10
-                if current_radius <= 10:  # 0-10圈浓度60
-                    ring_mass = INNER_MASS
-                elif current_radius <= 20:  # 11-20圈浓度30
-                    ring_mass = MID_MASS
-                elif current_radius <= 30:  # 21-23圈浓度10
-                    ring_mass = OUT_MASS
-
-                for px, py in ring_points:  # 将环上每个格子设为对应浓度
-                    grid[py, px] = ring_mass
-
-        self.pollution_grid = grid  # 更新网格
+        self.generate_gmm_field()
 
     def get_concentration(self, x, y):
         """查询指定坐标的污染浓度"""
@@ -192,51 +183,61 @@ class PollutionEnvironment:
             return self.pollution_grid[y, x]  # 返回网格中的浓度值
         return 0  # 越界返回0
 
-    def reduce_pollution(self, x, y, radius=CLEANING_RADIUS, amount=CLEANING_EFFICIENCY):
+    def reduce_pollution(self, x, y, neutralization_max, neutralization_decay, effective_radius):
         """
-        清理污染：在减少清洁Agent附近污染物浓度，最大减少值为cleaning_efficiency
+        距离衰减中和模型：中和效果 = neutralization_max * exp(-neutralization_decay * d²)
+        先计算有效半径，再对范围内每个格子按衰减系数降低污染
         """
         x, y = int(x), int(y)
-        remaining = amount
-        cells = []
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
+        r = effective_radius
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
                 ny, nx = y + dy, x + dx
                 if 0 <= nx < self.width and 0 <= ny < self.height:
-                    distance = np.sqrt(dx ** 2 + dy ** 2)
-                    if distance <= radius:
-                        cells.append((ny, nx, distance))
-        cells.sort(key=lambda c: c[2])
-        for ny, nx, dist in cells:
-            if remaining <= 0:
-                break
-            avail = self.pollution_grid[ny, nx]
-            take = min(avail, remaining)
-            self.pollution_grid[ny, nx] -= take
-            remaining -= take
+                    d_sq = dx ** 2 + dy ** 2
+                    effect = neutralization_max * np.exp(-neutralization_decay * d_sq)
+                    if effect < 0.01:
+                        continue
+                    reduction = effect * self.pollution_grid[ny, nx]
+                    self.pollution_grid[ny, nx] = max(0, self.pollution_grid[ny, nx] - reduction)
 
     def _diffuse_steady_rebalance(self):
         """
-        稳态再平衡扩散：清理后在网格上留下空洞，高浓度区域向低浓度/空洞区域流动
-        使用热扩散方程：new = old + diff * (邻居均值 - 自身)
+        对流-扩散方程求解：
+        ∂φ/∂t = D∇²φ - v·∇φ + S(x,y,t) - U(x,y,t)
+        D: 扩散系数, v: 对流速度, S: 源项, U: 汇项(清理)
+        使用有限差分法离散化，显式时间推进
         """
-        grid = self.pollution_grid  # 引用当前网格
-        diff = 0.25  # 扩散系数，控制每帧再平衡的幅度（0.25为最大稳定值）
-        new_grid = grid.copy()  # 复制网格，避免修改时影响原始数据
-        for i in range(1, self.height - 1):  # 遍历内部行（跳过边界行）
-            for j in range(1, self.width - 1):  # 遍历内部列（跳过边界列）
-                neighbors = (grid[i - 1, j] + grid[i + 1, j] +  # 上+下邻居浓度之和
-                             grid[i, j - 1] + grid[i, j + 1])  # 左+右邻居浓度之和
-                delta = (neighbors - 4 * grid[i, j]) * diff  # 扩散增量：邻居均值与自身的差×扩散系数
-                new_val = grid[i, j] + delta  # 新浓度 = 当前浓度 + 扩散增量
-                if 0 < new_val < self.min_concentration:  # 浓度在0和阈值之间
-                    new_val = 0  # 低于阈值视为无污染，置0
-                new_grid[i, j] = max(0, new_val)  # 确保浓度不为负
-        for source in self.pollution_sources:  # 遍历所有污染源
-            if source['active']:  # 源仍然活跃
-                cx, cy = int(source['x']), int(source['y'])  # 源坐标
-                new_grid[cy, cx] = max(new_grid[cy, cx], source['concentration'])  # 源点浓度不低于源记录值（持续补充）
-        self.pollution_grid = new_grid  # 更新网格
+        grid = self.pollution_grid.copy()
+        grid[0, :] = 0
+        grid[-1, :] = 0
+        grid[:, 0] = 0
+        grid[:, -1] = 0
+        D = DIFFUSION_COEFF
+        vx = CONVECTION_VX
+        vy = CONVECTION_VY
+        dx = DX
+        dt = 0.5 * dx ** 2 / (4 * D + 1e-10)
+
+        laplacian = (np.roll(grid, 1, axis=0) + np.roll(grid, -1, axis=0) +
+                     np.roll(grid, 1, axis=1) + np.roll(grid, -1, axis=1) - 4 * grid) / (dx ** 2)
+        grad_x = (np.roll(grid, -1, axis=1) - np.roll(grid, 1, axis=1)) / (2 * dx)
+        grad_y = (np.roll(grid, -1, axis=0) - np.roll(grid, 1, axis=0)) / (2 * dx)
+
+        source_term = np.zeros_like(grid)
+        if SOURCE_STRENGTH > 0:
+            for src in self.pollution_sources:
+                sx, sy = int(src['x']), int(src['y'])
+                source_term[sy, sx] += SOURCE_STRENGTH
+
+        new_grid = grid + dt * (D * laplacian - vx * grad_x - vy * grad_y + source_term)
+        new_grid[~self.region_mask] = 0
+        new_grid[0, :] = 0
+        new_grid[-1, :] = 0
+        new_grid[:, 0] = 0
+        new_grid[:, -1] = 0
+        new_grid = np.maximum(new_grid, 0)
+        self.pollution_grid = new_grid
 
 
 class Sensor:
@@ -256,69 +257,103 @@ class Sensor:
 
 class CleaningAgent:
     """清洁Agent类：在环境中移动并清理污染"""
-    def __init__(self, x, y, agent_id, speed=MOVING_SPEED, cleanup_radius=CLEANING_RADIUS, cleanup_rate=CLEANING_EFFICIENCY):
-        self.x = x  # 当前X坐标
-        self.y = y  # 当前Y坐标
-        self.id = agent_id  # Agent编号
-        self.speed = speed  # 移动速度：每帧最大移动距离
-        self.cleanup_radius = cleanup_radius  # 清理半径
-        self.cleanup_rate = cleanup_rate  # 每帧最大清理量
-        self.path_x = [x]  # X坐标移动轨迹
-        self.path_y = [y]  # Y坐标移动轨迹
-        self.total_cleaned = 0  # 累计清理总量
+    def __init__(self, x, y, agent_id, linear_speed=LINEAR_SPEED, angular_speed=ANGULAR_SPEED,
+                 neutralization_max=NEUTRALIZATION_MAX, neutralization_decay=NEUTRALIZATION_DECAY):
+        self.x = x
+        self.y = y
+        self.id = agent_id
+        self.linear_speed = linear_speed
+        self.angular_speed = angular_speed
+        self.heading = 0.0
+        self.overspray_on = True
+        self.neutralization_max = neutralization_max
+        self.neutralization_decay = neutralization_decay
+        self.effective_radius = int(np.sqrt(np.log(neutralization_max / 0.01) / neutralization_decay)) if neutralization_decay > 0 else 100
+        self.path_x = [x]
+        self.path_y = [y]
+        self.total_cleaned = 0
 
     def move_towards(self, target_x, target_y, environment):
-        """向目标点移动，每帧最多移动speed距离"""
-        dx = target_x - self.x  # X方向距离
-        dy = target_y - self.y  # Y方向距离
-        distance = np.sqrt(dx ** 2 + dy ** 2)  # 到目标的欧氏距离
-        if distance > 0:  # 未到达目标时
-            self.x += (dx / distance) * min(self.speed, distance)  # X方向移动：单位向量×步长
-            self.y += (dy / distance) * min(self.speed, distance)  # Y方向移动：单位向量×步长
-            self.x = max(0, min(environment.width - 1, self.x))  # X坐标限制在网格范围内
-            self.y = max(0, min(environment.height - 1, self.y))  # Y坐标限制在网格范围内
-        self.path_x.append(self.x)  # 记录X轨迹
-        self.path_y.append(self.y)  # 记录Y轨迹
+        """先转向目标方向，航向对齐后再前进"""
+        dx = target_x - self.x
+        dy = target_y - self.y
+        distance = np.sqrt(dx ** 2 + dy ** 2)
+        if distance < 0.5:
+            self.path_x.append(self.x)
+            self.path_y.append(self.y)
+            return
+        target_heading = np.arctan2(dy, dx)
+        angle_diff = (target_heading - self.heading + np.pi) % (2 * np.pi) - np.pi
+        if abs(angle_diff) > self.angular_speed:
+            self.heading += np.sign(angle_diff) * self.angular_speed
+            self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
+        else:
+            self.heading = target_heading
+            step = min(self.linear_speed, distance)
+            self.x += np.cos(self.heading) * step
+            self.y += np.sin(self.heading) * step
+            self.x = max(0, min(environment.width - 1, self.x))
+            self.y = max(0, min(environment.height - 1, self.y))
+        self.path_x.append(self.x)
+        self.path_y.append(self.y)
 
     def clean(self, environment):
-        """在当前位置执行清理，并统计清理量"""
-        cleaned_before = np.sum(environment.pollution_grid)  # 清理前环境总污染量
-        environment.reduce_pollution(self.x, self.y, self.cleanup_radius, self.cleanup_rate)  # 调用环境清理方法
-        cleaned_after = np.sum(environment.pollution_grid)  # 清理后环境总污染量
-        self.total_cleaned += (cleaned_before - cleaned_after)  # 累加本次清理量
+        """检测中心浓度，防过喷开关控制是否执行中和"""
+        local_conc = environment.get_concentration(self.x, self.y)
+        self.overspray_on = local_conc >= OVERSPRAY_THRESHOLD
+        if not self.overspray_on:
+            return
+        cleaned_before = np.sum(environment.pollution_grid)
+        environment.reduce_pollution(self.x, self.y, self.neutralization_max, self.neutralization_decay, self.effective_radius)
+        cleaned_after = np.sum(environment.pollution_grid)
+        self.total_cleaned += (cleaned_before - cleaned_after)
 
-    def calculate_voronoi_centroid(self, agents, sensors, environment):
+    def calculate_voronoi_centroid(self, agents, sensors, field_estimator):
         """
-        在Voronoi分区内，向浓度最高的sensor移动
-        先确定分区，再从分区内的sensor中选浓度最高的作为目标
+        基于 GPR 连续场估计计算 Voronoi 广义质心
         """
-        agent_positions = [(a.x, a.y) for a in agents]  # 收集所有Agent的坐标，如[(25,25),(75,25),(25,75),(75,75)]
-        my_idx = self.id  # 当前Agent的编号，0/1/2/3
+        agent_positions = np.array([(a.x, a.y) for a in agents])
+        my_idx = self.id
 
-        my_sensors = []  # 存放属于当前Agent分区的sensor
-        for sensor in sensors:  # 遍历每个sensor
-            # 计算该sensor到所有Agent的距离列表，如[30.0, 50.0, 70.0, 86.6]
-            distances = [np.sqrt((sensor.x - ax) ** 2 + (sensor.y - ay) ** 2) for ax, ay in agent_positions]
-            nearest = int(np.argmin(distances))  # argmin返回最小值的索引，即最近的Agent编号，如0
-            if nearest == my_idx:  # 如果最近的Agent就是自己
-                my_sensors.append(sensor)  # 这个sensor归我管，加入列表
+        # 获取 GPR 估计的连续场
+        est_field = field_estimator.estimated_field
+        if est_field is None:
+            return self.x, self.y
 
-        if not my_sensors:  # 如果分区内没有sensor（边界情况）
-            return self.x, self.y  # 待在原地
+        # 找出属于当前 Agent Voronoi 分区的所有网格点
+        # 为了加速，这里使用步长采样 (例如步长为5)
+        step = 5
+        y_indices = np.arange(0, est_field.shape[0], step)
+        x_indices = np.arange(0, est_field.shape[1], step)
+        xx, yy = np.meshgrid(x_indices, y_indices)
 
-        # 从分区内sensor中选浓度最高的：key=lambda指定按readings最后一个值比较
-        best_sensor = max(my_sensors, key=lambda s: s.readings[-1] if s.readings else 0)
-        target_x, target_y = best_sensor.x, best_sensor.y  # 目标设为该sensor的坐标
+        # 计算这些采样点到所有 Agent 的距离
+        # 形状: (num_points, num_agents)
+        points = np.vstack([xx.ravel(), yy.ravel()]).T
+        dists = np.sqrt(np.sum((points[:, None, :] - agent_positions[None, :, :]) ** 2, axis=2))
 
-        # 如果分区内最高浓度sensor读数都低于0.5，说明分区内已清干净
-        if best_sensor.readings and best_sensor.readings[-1] < 0.5:
-            # 从所有sensor中找全局浓度最高的
-            global_best = max(sensors, key=lambda s: s.readings[-1] if s.readings else 0)
-            # 全局最高浓度>0.5才值得去，否则待在原地
-            if global_best.readings and global_best.readings[-1] > 0.5:
-                target_x, target_y = global_best.x, global_best.y  # 改为向全局最高浓度sensor移动
+        # 找出距离当前 Agent 最近的点 (即属于我的 Voronoi 分区)
+        nearest_agent_idx = np.argmin(dists, axis=1)
+        my_mask = (nearest_agent_idx == my_idx)
 
-        return target_x, target_y  # 返回目标坐标
+        my_points = points[my_mask]
+        if len(my_points) == 0:
+            return self.x, self.y
+
+        # 获取这些点对应的估计浓度 (质量)
+        my_masses = est_field[my_points[:, 1].astype(int), my_points[:, 0].astype(int)]
+
+        total_mass = np.sum(my_masses)
+        if total_mass < 0.5:
+            # 质量太小，退化为向全局最高浓度点移动
+            max_idx = np.unravel_index(np.argmax(est_field), est_field.shape)
+            return max_idx[1], max_idx[0]
+
+        # 计算加权质心 (积分近似)
+        target_x = np.sum(my_masses * my_points[:, 0]) / total_mass
+        target_y = np.sum(my_masses * my_points[:, 1]) / total_mass
+
+        return target_x, target_y
 
     @staticmethod  # 静态方法，不依赖self，通过CleaningAgent.compute_voronoi_boundaries()调用
     def compute_voronoi_boundaries(agents, environment):
@@ -352,7 +387,7 @@ class CleaningAgent:
 
 class MultiAgentSimulation:
     """多Agent仿真类：管理环境、传感器、Agent和可视化"""
-    def __init__(self, width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM, n_sensors=SENSOR_NUM, n_sources=POLLUTION_SOURCE_NUM):
+    def __init__(self, width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM, n_sources=POLLUTION_SOURCE_NUM):
         self.width = width  # 仿真区域宽度
         self.height = height  # 仿真区域高度
         self.env = PollutionEnvironment(width, height)  # 创建污染环境实例
@@ -367,125 +402,281 @@ class MultiAgentSimulation:
         for i, (x, y) in enumerate(agent_positions):  # 在每个位置创建Agent
             self.agents.append(CleaningAgent(x, y, i))
 
-        self._generate_pollution_sources(n_sources)  # 生成污染源
+        self._generate_pollution_sources(n_sources)
+
+        self.avg_conc_history = []
+        self.centroid_dist_history = []  # 生成污染源
 
         self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 10))  # 创建2×2子图布局
         self.fig.suptitle('Multi-Agent Pollution Neutralization System', fontsize=14, fontweight='bold')  # 总标题
-        self.fig.patch.set_facecolor('#1a1a1a')  # 图表背景色设为深色
+        self.fig.patch.set_facecolor('white')
+
+        # --- 修复：在初始化时创建 twinx 轴 ---
+        self.ax4 = self.axes[1, 1]
+        self.ax4_r = self.ax4.twinx()
+
+        self.field_estimator = FieldEstimator(length_scale=60.0, noise_level=0.5)
 
     def _generate_sensor_positions(self):
-        """生成传感器位置：9×9网格均匀分布（81个点）"""
-        positions = []  # 位置列表
-        for hori_interval in range(1, 10):  # 水平方向9等分
-            for vert_interval in range(1, 10):  # 垂直方向9等分
-                positions.append((self.width * hori_interval // 10, self.height * vert_interval // 10))  # 计算网格交点坐标
-        return positions  # 返回81个传感器位置
+        """在11边形边界1/4处、顶点、以及内部每40像素网格上生成传感器"""
+        positions = []
+        # 顶点传感器
+        for vx, vy in POLYGON_VERTICES:
+            positions.append((int(vx), int(vy)))
+        # 每条边的1/4、2/4、3/4处放传感器
+        n = len(POLYGON_VERTICES)
+        for i in range(n):
+            x1, y1 = POLYGON_VERTICES[i]
+            x2, y2 = POLYGON_VERTICES[(i + 1) % n]
+            for j in range(1, 3):
+                t = j / 3
+                x = x1 + t * (x2 - x1)
+                y = y1 + t * (y2 - y1)
+                positions.append((int(x), int(y)))
+        # 内部网格传感器：每80像素一个，仅保留在多边形内部的点
+        for y in range(20, self.height, 80):
+            for x in range(20, self.width, 80):
+                if self.env.region_mask[y, x]:
+                    positions.append((x, y))
+        return positions
 
     def _generate_agent_positions(self, n):
-        """生成Agent初始位置：分布在四个象限的中心"""
-        positions = [(self.width // 4, self.height // 4),  # 左上象限中心
-                     (self.width // 4, self.height * 3 // 4),  # 左下象限中心
-                     (self.width * 3 // 4, self.height // 4),  # 右上象限中心
-                     (self.width * 3 // 4, self.height * 3 // 4)]  # 右下象限中心
-        return positions  # 返回4个Agent位置
+        """生成Agent初始位置"""
+        positions = [(90, 440), (120, 402), (150, 364), (180, 327),
+                     (210, 289), (190, 251), (170, 213), (150, 176),
+                     (130, 138), (110, 100)]
+        return positions
 
     def _generate_pollution_sources(self, n):
-        """随机生成n个污染源"""
-        for i in range(n):  # 循环n次
-            x = random.randint(40, self.width - 40)  # 随机X坐标，避开边缘20格
-            y = random.randint(40, self.height - 40)  # 随机Y坐标，避开边缘20格
-            x = 37
-            y = 38
-            self.env.add_pollution_source(x, y, concentration=INNER_MASS, radius=1)  # 添加污染源，浓度2000
+        """污染源由GMM在diffuse()首次调用时自动生成，此处无需手动添加"""
+        pass
+
+    def _compute_partition_assignments(self):
+        """计算每个传感器属于哪个Agent的Voronoi分区"""
+        agent_positions = [(a.x, a.y) for a in self.agents]
+        assignments = []
+        for sensor in self.sensors:
+            distances = [np.sqrt((sensor.x - ax) ** 2 + (sensor.y - ay) ** 2) for ax, ay in agent_positions]
+            assignments.append(int(np.argmin(distances)))
+        return assignments
 
     def update(self, frame):
-        """每帧更新：风场→扩散→传感器测量→Agent移动并清理"""
-        self.env.update_wind(frame)  # 更新风场
-        self.env.diffuse()  # 执行扩散计算
-        for sensor in self.sensors:  # 每个传感器测量浓度
+        """每帧更新：扩散→传感器测量→Agent移动并清理→评估指标"""
+        self.env.diffuse()
+        for sensor in self.sensors:
             sensor.measure(self.env)
-        for agent in self.agents:  # 每个Agent执行决策和清理
-            target_x, target_y = agent.calculate_voronoi_centroid(self.agents, self.sensors, self.env)  # 计算Voronoi分区污染加权质心
-            agent.move_towards(target_x, target_y, self.env)  # 向目标移动
-            agent.clean(self.env)  # 在当前位置清理
-        return frame  # 返回当前帧号
+
+        # 每帧（或每隔几帧）更新 GPR 连续场估计
+        if frame % 2 == 0:  # 为了性能，每2帧更新一次GPR
+            self.field_estimator.update_field(self.sensors, self.width, self.height, step=15)
+
+        for agent in self.agents:
+            # 传入 field_estimator
+            target_x, target_y = agent.calculate_voronoi_centroid(
+                self.agents, self.sensors, self.field_estimator
+            )
+            agent.move_towards(target_x, target_y, self.env)
+            agent.clean(self.env)
+
+        assignments = self._compute_partition_assignments()
+        total_avg_conc = 0.0
+        total_centroid_dist = 0.0
+        for i, agent in enumerate(self.agents):
+            my_sensors = [self.sensors[j] for j, a in enumerate(assignments) if a == i]
+            if my_sensors:
+                avg_conc = np.mean([s.readings[-1] if s.readings else 0 for s in my_sensors] +
+                                   [self.env.get_concentration(agent.x, agent.y)])
+                total_avg_conc += avg_conc
+                total_mass = sum(s.readings[-1] if s.readings else 0 for s in my_sensors)
+                if total_mass > 0.5:
+                    cx = sum((s.readings[-1] if s.readings else 0) * s.x for s in my_sensors) / total_mass
+                    cy = sum((s.readings[-1] if s.readings else 0) * s.y for s in my_sensors) / total_mass
+                else:
+                    cx, cy = agent.x, agent.y
+                total_centroid_dist += np.sqrt((agent.x - cx) ** 2 + (agent.y - cy) ** 2)
+
+        self.avg_conc_history.append(total_avg_conc)
+        self.centroid_dist_history.append(total_centroid_dist)
+        return frame
 
     def visualize(self, frame):
         """可视化当前帧：4个子图展示不同信息"""
-        for ax in self.axes.flat:  # 清空所有子图
-            ax.clear()  # 清除上帧内容
-            ax.set_xlim(0, self.width)  # 设置X轴范围
-            ax.set_ylim(0, self.height)  # 设置Y轴范围
-            ax.set_aspect('equal')  # 等比例显示
-            ax.set_facecolor('#2b2b2b')  # 子图深色背景
+        # 11边形闭合边界线坐标
+        polygon_closed = np.vstack([POLYGON_VERTICES, POLYGON_VERTICES[0]])
+
+        for ax in [self.axes[0, 0], self.axes[0, 1], self.axes[1, 0]]:
+            ax.clear()
+            ax.set_xlim(0, self.width)
+            ax.set_ylim(0, self.height)
+            ax.set_aspect('equal')
+            ax.set_facecolor('white')
 
         # --- 子图1：污染物浓度热力图 ---
-        ax1 = self.axes[0, 0]  # 左上子图
-        gamma = 0.3  # 幂次变换系数，<1拉伸低值区域，增强渐变层次感
-        display_grid = np.power(self.env.pollution_grid, gamma)  # 对浓度做幂次变换
-        vmax_display = np.power(60, gamma)  # 显示最大值，也做幂次变换保持一致
-        im = ax1.imshow(display_grid, cmap='inferno', origin='lower',  # 热力图，原点在左下
-                        extent=[0, self.width, 0, self.height],  # 坐标范围
-                        vmin=0, vmax=vmax_display,  # 颜色映射范围
-                        alpha=0.95, interpolation='bilinear')  # 透明度和双线性插值（平滑）
-        ax1.set_title('Pollution Diffusion (Inferno Colormap)', color='white')  # 标题
-        ax1.tick_params(colors='white')  # 刻度颜色
-
-        if abs(self.env.wind_x) > 0.1 or abs(self.env.wind_y) > 0.1:  # 风速较大时显示风向箭头
-            ax1.quiver(self.width * 0.85, self.height * 0.85, self.env.wind_x, self.env.wind_y,  # 箭头位置和方向
-                       scale=5, color='cyan', width=0.005)  # 箭头样式
-            ax1.text(self.width * 0.70, self.height * 0.9, f'Wind: ({self.env.wind_x:.1f}, {self.env.wind_y:.1f})',  # 风速文字
-                      color='cyan', fontsize=8)
+        ax1 = self.axes[0, 0]
+        gamma = 0.3
+        display_grid = np.power(self.env.pollution_grid, gamma)
+        display_grid[~self.env.region_mask] = np.nan
+        vmax_display = np.power(30, gamma)
+        im = ax1.imshow(display_grid, cmap='Blues', origin='lower',
+                        extent=[0, self.width, 0, self.height],
+                        vmin=0, vmax=vmax_display,
+                        alpha=0.95, interpolation='bilinear')
+        ax1.set_title('Pollution Diffusion', color='black')
+        ax1.tick_params(colors='black')
+        ax1.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
 
         # --- 子图2：Agent位置和路径 ---
-        ax2 = self.axes[0, 1]  # 右上子图
-        ax2.imshow(display_grid, cmap='inferno', origin='lower',  # 淡淡的污染背景
+        ax2 = self.axes[0, 1]
+        ax2.imshow(display_grid, cmap='Blues', origin='lower',
                    extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax_display, alpha=0.3,
                    interpolation='bilinear')
+        ax2.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
 
-        colors = ['red', 'lime', 'cyan', 'orange']  # Agent颜色列表
-        voronoi_segments = CleaningAgent.compute_voronoi_boundaries(self.agents, self.env)  # 计算Voronoi边界
-        for x1, y1, x2, y2 in voronoi_segments:  # 绘制Voronoi分区边界线
-            ax2.plot([x1, x2], [y1, y2], color='white', alpha=0.4, linewidth=0.5)
-        for i, agent in enumerate(self.agents):  # 遍历每个Agent
-            color = colors[i % len(colors)]  # 选取颜色
-            ax2.plot(agent.path_x[-40:], agent.path_y[-40:], color=color, alpha=0.6, linewidth=1.5)  # 绘制最近40步路径
-            ax2.scatter([agent.x], [agent.y], c=color, s=120, marker='o', edgecolors='white', linewidths=1.5, zorder=5)  # 绘制当前位置
-            circle = Circle((agent.x, agent.y), agent.cleanup_radius, fill=False, color=color, linestyle='--',  # 清理范围圆圈
-                            alpha=0.8, linewidth=1.5)
-            ax2.add_patch(circle)  # 添加圆圈到子图
-        ax2.set_title('Agent Paths and Coverage', color='white')  # 标题
-        ax2.tick_params(colors='white')  # 刻度颜色
-        ax2.legend([f'Agent {i}' for i in range(len(self.agents))], loc='upper right', fontsize='small',  # 图例
-                   facecolor='black', labelcolor='white')
-        ax2.grid(True, alpha=0.2, color='gray')  # 网格线
+        colors = ['red', 'lime', 'blue', 'orange']
+        voronoi_segments = CleaningAgent.compute_voronoi_boundaries(self.agents, self.env)
+        for x1, y1, x2, y2 in voronoi_segments:
+            ax2.plot([x1, x2], [y1, y2], color='gray', alpha=0.5, linewidth=0.5)
+        for i, agent in enumerate(self.agents):
+            color = colors[i % len(colors)]
+            ax2.plot(agent.path_x[-40:], agent.path_y[-40:], color=color, alpha=0.6, linewidth=1.5)
+            heading = agent.heading
+            size = 10
+            tip = (agent.x + size * np.cos(heading), agent.y + size * np.sin(heading))
+            left = (agent.x + size * 0.6 * np.cos(heading + 2.5), agent.y + size * 0.6 * np.sin(heading + 2.5))
+            right = (agent.x + size * 0.6 * np.cos(heading - 2.5), agent.y + size * 0.6 * np.sin(heading - 2.5))
+            triangle = MplPolygon([tip, left, right], closed=True, facecolor=color, edgecolor='black', linewidth=1.5, zorder=5)
+            ax2.add_patch(triangle)
+            if agent.overspray_on:
+                ax2.scatter([agent.x], [agent.y], c='red', s=8, marker='^', zorder=6)
+            circle = Circle((agent.x, agent.y), agent.effective_radius, fill=False, color=color, linestyle='--',
+                            alpha=0.4, linewidth=1.0)
+            ax2.add_patch(circle)
+        ax2.set_title('Agent Paths and Coverage', color='black')
+        ax2.tick_params(colors='black')
+        ax2.legend([f'Agent {i}' for i in range(len(self.agents))], loc='upper right', fontsize='small',
+                   facecolor='white', labelcolor='black', edgecolor='gray')
+        ax2.grid(True, alpha=0.2, color='gray')
 
         # --- 子图3：传感器位置和读数 ---
-        ax3 = self.axes[1, 0]  # 左下子图
-        ax3.imshow(display_grid, cmap='inferno', origin='lower',  # 淡淡的污染背景
+        ax3 = self.axes[1, 0]
+        ax3.imshow(display_grid, cmap='Blues', origin='lower',
                    extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax_display, alpha=0.3,
                    interpolation='bilinear')
-        sensor_x = [s.x for s in self.sensors]  # 所有传感器X坐标
-        sensor_y = [s.y for s in self.sensors]  # 所有传感器Y坐标
-        sensor_conc = [s.readings[-1] if s.readings else 0 for s in self.sensors]  # 最新浓度读数
-        ax3.scatter(sensor_x, sensor_y, c=sensor_conc, cmap='inferno', s=200, marker='^', edgecolors='white', vmin=0,  # 三角形散点图，颜色映射浓度
+        ax3.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
+        sensor_x = [s.x for s in self.sensors]
+        sensor_y = [s.y for s in self.sensors]
+        sensor_conc = [s.readings[-1] if s.readings else 0 for s in self.sensors]
+        ax3.scatter(sensor_x, sensor_y, c=sensor_conc, cmap='Blues', s=200, marker='^', edgecolors='black', vmin=0,
                      vmax=100)
-        ax3.set_title('Sensor Readings', color='white')  # 标题
-        ax3.tick_params(colors='white')  # 刻度颜色
-        for i, sensor in enumerate(self.sensors):  # 为每个传感器标注编号和读数
-            ax3.annotate(f'S{i}\n{sensor_conc[i]:.0f}', (sensor.x + 2, sensor.y + 2), fontsize=8, color='white',  # 文字标注
+        ax3.set_title('Sensor Readings', color='black')
+        ax3.tick_params(colors='black')
+        for i, sensor in enumerate(self.sensors):
+            ax3.annotate(f'S{i}\n{sensor_conc[i]:.0f}', (sensor.x + 2, sensor.y + 2), fontsize=8, color='black',
                           fontweight='bold')
-        ax3.grid(True, alpha=0.2, color='gray')  # 网格线
+        ax3.grid(True, alpha=0.2, color='gray')
 
-        # --- 子图4：统计信息 ---
-        ax4 = self.axes[1, 1]  # 右下子图
-        ax4.axis('off')  # 关闭坐标轴
-        total_pollution = np.sum(self.env.pollution_grid)  # 计算当前环境总污染量
-        stats_text = f'=== Simulation Statistics ===\n\nFrame: {frame}\nTotal Pollution: {total_pollution:.1f}\n\nWind: X={self.env.wind_x:.2f}, Y={self.env.wind_y:.2f}\n\n=== Agent Performance ===\n'  # 统计文本
-        for i, agent in enumerate(self.agents):  # 每个Agent的清理量
-            stats_text += f'Agent {i}: Cleaned {agent.total_cleaned:.1f} units\n'
-        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11, family='monospace',  # 显示统计文本
-                  verticalalignment='top', color='white')
+        # --- 子图4：评估曲线 ---
+        self.ax4.clear()  # 清空主轴（蓝线）
+        self.ax4_r.clear()  # ★ 清空副轴（橙线），而不是重新 twinx()
+        self.ax4.set_facecolor('white')
+
+        frames_x = list(range(len(self.avg_conc_history)))
+        if frames_x:
+            # 蓝线：画在主轴
+            self.ax4.plot(frames_x, self.avg_conc_history,
+                          color='steelblue', linewidth=1.2, label='Avg Conc Sum')
+            # self.ax4.set_ylabel('Avg Concentration Sum', color='steelblue', fontsize=9)
+            self.ax4.tick_params(axis='y', labelcolor='steelblue')
+            self.ax4.tick_params(axis='x', colors='black')
+
+            # 橙线：画在已有的副轴上（不再 twinx）
+            self.ax4_r.plot(frames_x, self.centroid_dist_history,
+                            color='orangered', linewidth=1.2, label='Centroid Dist Sum')
+            # self.ax4_r.set_ylabel('Centroid Distance Sum', color='orangered', fontsize=9)
+            self.ax4_r.tick_params(axis='y', labelcolor='orangered')
+
+            # 合并两个轴的图例
+            lines1, labels1 = self.ax4.get_legend_handles_labels()
+            lines2, labels2 = self.ax4_r.get_legend_handles_labels()
+            self.ax4.legend(lines1 + lines2, labels1 + labels2,
+                            loc='upper right', fontsize=8,
+                            facecolor='white', labelcolor='black', edgecolor='gray')
+
+        self.ax4.set_title('Evaluation Metrics', color='black', fontsize=10)
+        self.ax4.set_xlabel('Frame', color='black', fontsize=9)
+        self.ax4.grid(True, alpha=0.2, color='gray')
+
+    def save_gpr_snapshot(self, save_path='gpr_reconstruction.png'):
+        """使用当前传感器读数进行GPR场估计，并保存对比图到本地"""
+        print("\n正在准备 GPR 场还原图片...")
+
+        # 1. 收集当前所有传感器的位置和读数
+        sensor_x = [s.x for s in self.sensors]
+        sensor_y = [s.y for s in self.sensors]
+        sensor_readings = [s.readings[-1] if s.readings else 0 for s in self.sensors]
+
+        X_train = np.vstack((sensor_x, sensor_y)).T
+        y_train = np.array(sensor_readings)
+
+        if np.max(y_train) < 1e-5:
+            print("传感器读数全为0，跳过GPR估计。")
+            return
+
+        # 2. 配置并训练 GPR 模型
+        # length_scale 控制平滑度，alpha 控制对噪声的容忍度
+        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=40.0, length_scale_bounds=(1e-1, 1e3))
+        gpr = GaussianProcessRegressor(kernel=kernel, alpha=0.5, normalize_y=True)
+        gpr.fit(X_train, y_train)
+
+        # 3. 降采样预测全场 (步长设为4，即预测 150x150 的网格，大幅提速)
+        step = 4
+        y_grid, x_grid = np.mgrid[0:self.height:step, 0:self.width:step]
+        X_test = np.vstack((x_grid.ravel(), y_grid.ravel())).T
+
+        print("正在预测全场 (GPR)，请稍候...")
+        y_pred = gpr.predict(X_test)
+        gpr_field_low = y_pred.reshape(x_grid.shape)
+
+        # 4. 获取真实场并计算低分辨率下的误差
+        true_field = self.env.pollution_grid
+        true_field_low = true_field[0:self.height:step, 0:self.width:step]
+        error_field = np.abs(true_field_low - gpr_field_low)
+
+        # 5. 绘制 1行3列 的对比图
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle('Gaussian Process Regression: Field Reconstruction', fontsize=16, fontweight='bold')
+
+        vmax = np.max(true_field)  # 统一颜色映射的最大值
+
+        # 子图1：真实污染场
+        im1 = axes[0].imshow(true_field, cmap='Blues', origin='lower',
+                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax, interpolation='bilinear')
+        axes[0].scatter(sensor_x, sensor_y, c='red', s=20, marker='^', edgecolors='black', label='Sensors')
+        axes[0].set_title('True Pollution Field')
+        axes[0].set_aspect('equal')
+        plt.colorbar(im1, ax=axes[0])
+
+        # 子图2：GPR 估计场 (利用 extent 和 interpolation 自动平滑放大)
+        im2 = axes[1].imshow(gpr_field_low, cmap='Blues', origin='lower',
+                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax, interpolation='bilinear')
+        axes[1].scatter(sensor_x, sensor_y, c='red', s=20, marker='^', edgecolors='black')
+        axes[1].set_title('GPR Estimated Field')
+        axes[1].set_aspect('equal')
+        plt.colorbar(im2, ax=axes[1])
+
+        # 子图3：绝对误差场
+        im3 = axes[2].imshow(error_field, cmap='hot_r', origin='lower',
+                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax * 0.2, interpolation='bilinear')
+        axes[2].scatter(sensor_x, sensor_y, c='cyan', s=20, marker='^', edgecolors='black')
+        axes[2].set_title('Absolute Estimation Error')
+        axes[2].set_aspect('equal')
+        plt.colorbar(im3, ax=axes[2])
+
+        plt.tight_layout()
+        # 保存高清图片
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"✓ GPR 场还原图片已保存至: {save_path}")
+        plt.close(fig)  # 关闭图片释放内存
 
     def run(self, frames=200, interval=100, save_gif=False):
         """运行仿真：生成动画并显示或保存为GIF"""
@@ -503,5 +694,8 @@ class MultiAgentSimulation:
 
 
 if __name__ == "__main__":
-    sim = MultiAgentSimulation(width=100, height=100, n_agents=4, n_sensors=17, n_sources=1)  # 创建仿真实例
-    ani = sim.run(frames=300, interval=80, save_gif=True)  # 运行150帧，帧间隔80ms，保存为GIF
+    sim = MultiAgentSimulation(width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM, n_sources=POLLUTION_SOURCE_NUM)
+    ani = sim.run(frames=150, interval=80, save_gif=True)
+
+    # 在仿真结束后（此时传感器已经有了丰富的历史读数），保存 GPR 场还原图片
+    # sim.save_gpr_snapshot('gpr_reconstruction.png')
