@@ -1,701 +1,571 @@
-import numpy as np  # 数值计算库，用于矩阵运算和数学函数
-import matplotlib.pyplot as plt  # 绑图库，用于生成热力图和动画
-from matplotlib.animation import FuncAnimation  # 动画类，用于逐帧更新可视化
-import random
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle, Polygon as MplPolygon
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
+from matplotlib.path import Path
+import random
 
-# 污染场参数（高斯混合模型）
-GAUSSIAN_NUM = 5  # 高斯源数量 N_s
-GAUSSIAN_AMPLITUDE_RANGE = (1, 3)  # 每个高斯源的振幅 A_k 范围
-GAUSSIAN_SIGMA_RANGE = (30, 30)  # 每个高斯源的扩散半径 σ_k 范围
-NOISE_LEVEL = 0.5  # 噪声水平
+# ================================================================
+# 1. 论文参数
+# ================================================================
+GAUSSIAN_NUM = 5
+GAUSSIAN_AMPLITUDE = 0.5
+GAUSSIAN_SIGMA = 60
+NOISE_LEVEL = 0.0
 
-# 对流-扩散方程参数
-DIFFUSION_COEFF = 0.25  # 扩散系数 D
-CONVECTION_VX = 0.0  # 对流速度X分量 v_x
-CONVECTION_VY = 0.0  # 对流速度Y分量 v_y
-SOURCE_STRENGTH = 0.0  # 源项强度 S
+ALPHA = 1.0
+BETA = 0.0003
+KAPPA_P = 1.0
+OVERSPRAY_EPSILON = 0.02
 
-# 清洁Agent参数
-NEUTRALIZATION_MAX = 1.0
-NEUTRALIZATION_DECAY = 0.0003
-LINEAR_SPEED = 1.0
-ANGULAR_SPEED = 0.15
-OVERSPRAY_THRESHOLD = 0.2
+KAPPA_V = 1.5
+KAPPA_OMEGA = 2.5
+LAMBDA_SINGULAR = 0.5
+V_MAX = 2.0
+OMEGA_MAX = 0.5
+DT_MOVE = 0.2
 
-# 场景模拟参数
-POLLUTION_SOURCE_NUM = GAUSSIAN_NUM
-WIDTH = 600 # 图片宽度
-HEIGHT = 600 # 图片高度
-AGENTS_NUM = 10 # 清洁装置数量
+WIDTH, HEIGHT = 600, 600
+AGENTS_NUM = 10
 
-# 11边形顶点坐标（论文指定）
+# ★ 新增：高斯基重构参数
+SIGMA_BASIS = 40.0  # 基函数宽度 σ_b
+LAMBDA_RLS = 0.95  # RLS 遗忘因子
+REGULARIZATION = 1e-3  # 正则化项
+
 POLYGON_VERTICES = np.array([
     (80, 30), (270, 10), (390, 25), (500, 120), (520, 340),
     (510, 400), (490, 470), (200, 520), (80, 470), (25, 320), (35, 165)
 ])
-
-# 离散化步长
-DX = 2  # Dx=Dy=2m
-
-def point_in_polygon(x, y, vertices):
-    """射线法判断点(x,y)是否在多边形内部"""
-    n = len(vertices)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = vertices[i]
-        xj, yj = vertices[j]
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
+POLYGON_PATH = Path(POLYGON_VERTICES)
 
 
-def create_region_mask(width, height, vertices):
-    """创建多边形区域的掩码矩阵，区域内为True"""
-    mask = np.zeros((height, width), dtype=bool)
-    for y in range(height):
-        for x in range(width):
-            if point_in_polygon(x, y, vertices):
-                mask[y, x] = True
-    return mask
+# ================================================================
+# 2. 区域掩码
+# ================================================================
+def create_region_mask(width, height):
+    y, x = np.mgrid[0:height, 0:width]
+    pts = np.column_stack([x.ravel(), y.ravel()])
+    return POLYGON_PATH.contains_points(pts).reshape(height, width)
 
 
-class FieldEstimator:
-    """基于高斯过程回归的连续污染场估计器"""
+# ================================================================
+# 3. ★ 分布式高斯基场重构器（替代GPR）
+# ================================================================
+class GaussianBasisFieldEstimator:
+    """
+    论文方法：分布式高斯基函数重构
+    l_hat(q,t) = sum_k w_k(t) * phi_k(q)
+    phi_k(q) = exp(-||q - c_k||^2 / (2*sigma_b^2))
+    """
 
-    def __init__(self, length_scale=50.0, noise_level=1.0):
-        # 定义 GPR 核函数：常数核 * 径向基核 (RBF)
-        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale, (1e-2, 1e2))
-        self.gpr = GaussianProcessRegressor(kernel=kernel, alpha=noise_level, normalize_y=True)
+    def __init__(self, centers, sigma_basis=SIGMA_BASIS, lambda_rls=LAMBDA_RLS):
+        """
+        centers: (K, 2) 基函数中心点坐标
+        """
+        self.centers = np.asarray(centers)
+        self.K = len(centers)  # 基函数数量
+        self.sigma_b = sigma_basis
+        self.lambda_rls = lambda_rls
+
+        # 权重向量 w(t)
+        self.w = np.zeros(self.K)
+
+        # RLS 协方差矩阵 P(t)
+        self.P = np.eye(self.K) / REGULARIZATION
+
         self.estimated_field = None
-        self.grid_x = None
-        self.grid_y = None
 
-    def update_field(self, sensors, width, height, step=10):
+    def compute_basis_functions(self, query_points):
         """
-        根据传感器读数更新连续场估计。
-        step: 预测网格的步长，为了计算速度，不能是1（600x600太慢），建议10或20。
+        计算基函数值矩阵 Φ
+        query_points: (N, 2)
+        返回: (N, K) 矩阵，Φ[i,k] = phi_k(query_points[i])
         """
-        # 1. 收集训练数据 (传感器坐标和读数)
-        X_train = np.array([[s.x, s.y] for s in sensors])
-        y_train = np.array([s.readings[-1] if s.readings else 0 for s in sensors])
+        # 计算每个查询点到每个中心的距离平方
+        # query_points: (N, 2), centers: (K, 2)
+        # 结果: (N, K)
+        diff = query_points[:, None, :] - self.centers[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=2)
 
-        # 如果所有读数都是0，GPR会报错，直接返回全0场
-        if np.max(y_train) < 1e-5:
-            self.estimated_field = np.zeros((height, width))
+        # 高斯基函数
+        Phi = np.exp(-dist_sq / (2 * self.sigma_b ** 2))
+        return Phi
+
+    def update_weights_rls(self, measurements, positions):
+        """
+        递推最小二乘（RLS）更新权重
+        measurements: (N,) 传感器读数
+        positions: (N, 2) 传感器位置
+        """
+        if len(measurements) == 0:
             return
 
-        # 2. 拟合 GPR 模型
-        self.gpr.fit(X_train, y_train)
+        # ★ 修复：将 positions 转换为 numpy array
+        positions = np.asarray(positions)
 
-        # 3. 生成预测网格 (降采样以加速)
-        y_grid, x_grid = np.mgrid[0:height:step, 0:width:step]
-        X_test = np.vstack([x_grid.ravel(), y_grid.ravel()]).T
+        # 计算基函数矩阵 Φ
+        Phi = self.compute_basis_functions(positions)  # (N, K)
+        y = np.asarray(measurements)  # (N,)
 
-        # 4. 预测连续场
-        y_pred = self.gpr.predict(X_test)
+        # RLS 更新
+        e = y - Phi @ self.w
 
-        # 将预测结果重塑为网格，并放大回原分辨率 (最近邻插值)
-        low_res_field = y_pred.reshape(x_grid.shape)
-        self.estimated_field = np.repeat(np.repeat(low_res_field, step, axis=0), step, axis=1)
-        # 裁剪到实际宽高
-        self.estimated_field = self.estimated_field[:height, :width]
+        Phi_T = Phi.T  # (K, N)
+
+        F = self.lambda_rls * np.eye(len(y)) + Phi @ self.P @ Phi_T
+        K_gain = self.P @ Phi_T @ np.linalg.inv(F)
+
+        self.w = self.w + K_gain @ e
+        self.P = (1.0 / self.lambda_rls) * (self.P - K_gain @ Phi @ self.P)
+
+    def update_field(self, positions, readings, width, height, region_mask, step=12):
+        """
+        更新全场估计
+        """
+        # 更新权重
+        self.update_weights_rls(readings, positions)
+
+        # 生成查询网格
+        yg, xg = np.mgrid[0:height:step, 0:width:step]
+        query_pts = np.column_stack([xg.ravel(), yg.ravel()])
+
+        # 计算基函数值
+        Phi = self.compute_basis_functions(query_pts)  # (N_query, K)
+
+        # 估计场
+        y_pred = Phi @ self.w  # (N_query,)
+
+        # 重塑为网格
+        low = y_pred.reshape(xg.shape)
+
+        # 放大到原分辨率
+        field = np.repeat(np.repeat(low, step, axis=0), step, axis=1)
+        field = field[:height, :width]
+
+        # 应用区域掩码
+        field[~region_mask] = 0.0
+        field = np.maximum(field, 0.0)  # 浓度非负
+
+        self.estimated_field = field
 
 
+# ================================================================
+# 4. 污染环境
+# ================================================================
 class PollutionEnvironment:
-    """污染环境类：管理污染网格、污染源、扩散和清理逻辑"""
-    def __init__(self, width=WIDTH, height=HEIGHT, diffusion_mode='steady'):
+    def __init__(self, width=WIDTH, height=HEIGHT):
         self.width = width
         self.height = height
-
-        self.diffusion_mode = diffusion_mode
+        self.region_mask = create_region_mask(width, height)
         self.pollution_grid = np.zeros((height, width))
-        self.pollution_sources = []
         self.initialized = False
-
-        # 11边形区域掩码
-        print("正在生成11边形区域掩码...")
-        self.region_mask = create_region_mask(width, height, POLYGON_VERTICES)
-        print(f"区域掩码生成完成，区域内格子数: {np.sum(self.region_mask)}")
+        self.pollution_sources = []
 
     def generate_gmm_field(self):
-        """
-        用高斯混合模型生成初始污染场：
-        φ(x,y) = Σ A_k * exp(-((x-x_k)² + (y-y_k)²) / (2σ_k²)) + Noise
-        污染源位置在11边形区域内随机生成
-        """
         self.pollution_sources = []
         for _ in range(GAUSSIAN_NUM):
             while True:
-                x = random.randint(40, self.width - 40)
-                y = random.randint(40, self.height - 40)
+                x = random.randint(60, self.width - 60)
+                y = random.randint(60, self.height - 60)
                 if self.region_mask[y, x]:
-                    # 如果不控制污染源点之间的距离可直接break
-                    # break
-                    # 如果想保证污染源直接不出现重合 可以设置下方条件保证污染源直接的间距
-                    if all(np.sqrt((x - s['x'])**2 + (y - s['y'])**2) >= 40 for s in self.pollution_sources):
+                    if all(np.hypot(x - s['x'], y - s['y']) >= 70 for s in self.pollution_sources):
                         break
-            A_k = random.uniform(*GAUSSIAN_AMPLITUDE_RANGE)
-            sigma_k = random.uniform(*GAUSSIAN_SIGMA_RANGE)
-            self.pollution_sources.append({'x': x, 'y': y, 'amplitude': A_k, 'sigma': sigma_k})
+            self.pollution_sources.append({'x': x, 'y': y})
 
         yy, xx = np.mgrid[0:self.height, 0:self.width]
         field = np.zeros((self.height, self.width))
         for src in self.pollution_sources:
-            dx = xx - src['x']
-            dy = yy - src['y']
-            field += src['amplitude'] * np.exp(-(dx ** 2 + dy ** 2) / (2 * src['sigma'] ** 2))
-        field += np.random.normal(0, NOISE_LEVEL, (self.height, self.width))
-        field[~self.region_mask] = 0
-        field = np.maximum(field, 0)
-        self.pollution_grid = field
+            d2 = (xx - src['x']) ** 2 + (yy - src['y']) ** 2
+            field += GAUSSIAN_AMPLITUDE * np.exp(-d2 / (2 * GAUSSIAN_SIGMA ** 2))
 
-    def diffuse(self):
-        """扩散入口：根据扩散模式选择对应的扩散方法"""
-        if self.diffusion_mode == 'steady':  # 稳态模式
-            if not self.initialized:  # 首次执行：生成稳态初始分布
-                self._diffuse_steady()
-                self.initialized = True  # 标记已初始化，后续不再重新生成
-            else:  # 非首次：执行再平衡扩散（让高浓度向低浓度/空洞区域流动）
-                self._diffuse_steady_rebalance()
-        elif self.diffusion_mode == 'transient':  # 瞬态模式
-            self._diffuse_transient()  # 每帧重新计算扩散分布
+        field[~self.region_mask] = 0.0
+        self.pollution_grid = np.maximum(field, 0.0)
 
-    def _diffuse_transient(self):
-        """瞬态模式暂未实现，预留接口"""
-        pass
-
-    def _diffuse_steady(self):
-        """
-        稳态扩散初始化：用高斯混合模型生成初始污染场
-        只在首次调用时执行
-        """
-        self.generate_gmm_field()
+    def init_steady(self):
+        if not self.initialized:
+            self.generate_gmm_field()
+            self.initialized = True
 
     def get_concentration(self, x, y):
-        """查询指定坐标的污染浓度"""
-        x, y = int(x), int(y)  # 坐标取整
-        if 0 <= x < self.width and 0 <= y < self.height:  # 边界检查
-            return self.pollution_grid[y, x]  # 返回网格中的浓度值
-        return 0  # 越界返回0
+        xi, yi = int(round(x)), int(round(y))
+        if 0 <= xi < self.width and 0 <= yi < self.height:
+            return self.pollution_grid[yi, xi]
+        return 0.0
 
-    def reduce_pollution(self, x, y, neutralization_max, neutralization_decay, effective_radius):
-        """
-        距离衰减中和模型：中和效果 = neutralization_max * exp(-neutralization_decay * d²)
-        先计算有效半径，再对范围内每个格子按衰减系数降低污染
-        """
-        x, y = int(x), int(y)
-        r = effective_radius
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                ny, nx = y + dy, x + dx
-                if 0 <= nx < self.width and 0 <= ny < self.height:
-                    d_sq = dx ** 2 + dy ** 2
-                    effect = neutralization_max * np.exp(-neutralization_decay * d_sq)
-                    if effect < 0.01:
-                        continue
-                    reduction = effect * self.pollution_grid[ny, nx]
-                    self.pollution_grid[ny, nx] = max(0, self.pollution_grid[ny, nx] - reduction)
+    def apply_additive_spray(self, px, py, u_i, radius):
+        cx, cy = int(round(px)), int(round(py))
+        r = radius
+        y0, y1 = max(0, cy - r), min(self.height, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(self.width, cx + r + 1)
 
-    def _diffuse_steady_rebalance(self):
-        """
-        对流-扩散方程求解：
-        ∂φ/∂t = D∇²φ - v·∇φ + S(x,y,t) - U(x,y,t)
-        D: 扩散系数, v: 对流速度, S: 源项, U: 汇项(清理)
-        使用有限差分法离散化，显式时间推进
-        """
-        grid = self.pollution_grid.copy()
-        grid[0, :] = 0
-        grid[-1, :] = 0
-        grid[:, 0] = 0
-        grid[:, -1] = 0
-        D = DIFFUSION_COEFF
-        vx = CONVECTION_VX
-        vy = CONVECTION_VY
-        dx = DX
-        dt = 0.5 * dx ** 2 / (4 * D + 1e-10)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
 
-        laplacian = (np.roll(grid, 1, axis=0) + np.roll(grid, -1, axis=0) +
-                     np.roll(grid, 1, axis=1) + np.roll(grid, -1, axis=1) - 4 * grid) / (dx ** 2)
-        grad_x = (np.roll(grid, -1, axis=1) - np.roll(grid, 1, axis=1)) / (2 * dx)
-        grad_y = (np.roll(grid, -1, axis=0) - np.roll(grid, 1, axis=0)) / (2 * dx)
+        f_pq = ALPHA * np.exp(-BETA * d2)
+        valid = (f_pq >= 0.01) & self.region_mask[y0:y1, x0:x1]
 
-        source_term = np.zeros_like(grid)
-        if SOURCE_STRENGTH > 0:
-            for src in self.pollution_sources:
-                sx, sy = int(src['x']), int(src['y'])
-                source_term[sy, sx] += SOURCE_STRENGTH
-
-        new_grid = grid + dt * (D * laplacian - vx * grad_x - vy * grad_y + source_term)
-        new_grid[~self.region_mask] = 0
-        new_grid[0, :] = 0
-        new_grid[-1, :] = 0
-        new_grid[:, 0] = 0
-        new_grid[:, -1] = 0
-        new_grid = np.maximum(new_grid, 0)
-        self.pollution_grid = new_grid
+        delta = np.where(valid, f_pq * u_i, 0.0)
+        self.pollution_grid[y0:y1, x0:x1] = np.maximum(0.0, self.pollution_grid[y0:y1, x0:x1] + delta)
 
 
+# ================================================================
+# 5. 固定传感器
+# ================================================================
 class Sensor:
-    """传感器类：部署在固定位置，每帧测量所在位置的污染浓度"""
-    def __init__(self, x, y, sensor_id):
-        self.x = x  # 传感器X坐标
-        self.y = y  # 传感器Y坐标
-        self.id = sensor_id  # 传感器编号
-        self.readings = []  # 历史浓度读数列表
+    def __init__(self, x, y, sid):
+        self.x, self.y, self.id = x, y, sid
+        self.readings = []
 
-    def measure(self, environment):
-        """测量当前位置的污染浓度并记录"""
-        concentration = environment.get_concentration(self.x, self.y)  # 从环境获取浓度
-        self.readings.append(concentration)  # 记录到历史读数
-        return concentration  # 返回当前浓度
+    def measure(self, env):
+        c = env.get_concentration(self.x, self.y)
+        self.readings.append(c)
+        return c
 
 
+# ================================================================
+# 6. 清洁 Agent
+# ================================================================
 class CleaningAgent:
-    """清洁Agent类：在环境中移动并清理污染"""
-    def __init__(self, x, y, agent_id, linear_speed=LINEAR_SPEED, angular_speed=ANGULAR_SPEED,
-                 neutralization_max=NEUTRALIZATION_MAX, neutralization_decay=NEUTRALIZATION_DECAY):
-        self.x = x
-        self.y = y
-        self.id = agent_id
-        self.linear_speed = linear_speed
-        self.angular_speed = angular_speed
+    def __init__(self, x, y, aid):
+        self.x, self.y, self.id = float(x), float(y), aid
         self.heading = 0.0
-        self.overspray_on = True
-        self.neutralization_max = neutralization_max
-        self.neutralization_decay = neutralization_decay
-        self.effective_radius = int(np.sqrt(np.log(neutralization_max / 0.01) / neutralization_decay)) if neutralization_decay > 0 else 100
-        self.path_x = [x]
-        self.path_y = [y]
-        self.total_cleaned = 0
+        self.v_i = 0.0
+        self.omega_i = 0.0
+        self.sigma_i = 0.0
+        self.u_i = 0.0
+        self.bar_l_i = 0.0
+        self.effective_radius = int(np.sqrt(np.log(100 * ALPHA) / BETA))
+        self.path_x, self.path_y = [x], [y]
 
-    def move_towards(self, target_x, target_y, environment):
-        """先转向目标方向，航向对齐后再前进"""
-        dx = target_x - self.x
-        dy = target_y - self.y
-        distance = np.sqrt(dx ** 2 + dy ** 2)
-        if distance < 0.5:
-            self.path_x.append(self.x)
-            self.path_y.append(self.y)
-            return
-        target_heading = np.arctan2(dy, dx)
-        angle_diff = (target_heading - self.heading + np.pi) % (2 * np.pi) - np.pi
-        if abs(angle_diff) > self.angular_speed:
-            self.heading += np.sign(angle_diff) * self.angular_speed
-            self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
+        self.prev_cx = None
+        self.prev_cy = None
+        self.c_dot_x = 0.0
+        self.c_dot_y = 0.0
+
+    def decide_spray(self, avg_conc):
+        self.bar_l_i = avg_conc
+        if avg_conc > OVERSPRAY_EPSILON:
+            self.sigma_i = 1.0
+            self.u_i = -KAPPA_P * self.sigma_i * avg_conc
         else:
-            self.heading = target_heading
-            step = min(self.linear_speed, distance)
-            self.x += np.cos(self.heading) * step
-            self.y += np.sin(self.heading) * step
-            self.x = max(0, min(environment.width - 1, self.x))
-            self.y = max(0, min(environment.height - 1, self.y))
+            self.sigma_i = 0.0
+            self.u_i = 0.0
+
+    def move_towards(self, tx, ty, env):
+        dx, dy = tx - self.x, ty - self.y
+        dist = np.hypot(dx, dy)
+
+        if dist < 1.0:
+            self.v_i = self.omega_i = 0.0
+            self.prev_cx = tx
+            self.prev_cy = ty
+            return
+
+        if self.prev_cx is not None:
+            self.c_dot_x = (tx - self.prev_cx) / DT_MOVE
+            self.c_dot_y = (ty - self.prev_cy) / DT_MOVE
+        else:
+            self.c_dot_x = 0.0
+            self.c_dot_y = 0.0
+
+        self.prev_cx = tx
+        self.prev_cy = ty
+
+        ct, st = np.cos(self.heading), np.sin(self.heading)
+        ex = dx * ct + dy * st
+        ey = -dx * st + dy * ct
+
+        self.omega_i = KAPPA_OMEGA * np.arctan(ey / (ex + LAMBDA_SINGULAR))
+        self.v_i = (KAPPA_V * ex + self.c_dot_x * ct + self.c_dot_y * st)
+
+        self.v_i = np.clip(self.v_i, 0, V_MAX)
+        self.omega_i = np.clip(self.omega_i, -OMEGA_MAX, OMEGA_MAX)
+
+        self.heading += self.omega_i * DT_MOVE
+        self.heading = (self.heading + np.pi) % (2 * np.pi) - np.pi
+
+        nx = self.x + self.v_i * np.cos(self.heading) * DT_MOVE
+        ny = self.y + self.v_i * np.sin(self.heading) * DT_MOVE
+
+        ix, iy = int(round(nx)), int(round(ny))
+        if 0 <= ix < env.width and 0 <= iy < env.height and env.region_mask[iy, ix]:
+            self.x, self.y = nx, ny
+        else:
+            self.v_i = 0.0
+
         self.path_x.append(self.x)
         self.path_y.append(self.y)
 
-    def clean(self, environment):
-        """检测中心浓度，防过喷开关控制是否执行中和"""
-        local_conc = environment.get_concentration(self.x, self.y)
-        self.overspray_on = local_conc >= OVERSPRAY_THRESHOLD
-        if not self.overspray_on:
-            return
-        cleaned_before = np.sum(environment.pollution_grid)
-        environment.reduce_pollution(self.x, self.y, self.neutralization_max, self.neutralization_decay, self.effective_radius)
-        cleaned_after = np.sum(environment.pollution_grid)
-        self.total_cleaned += (cleaned_before - cleaned_after)
+    def stop(self):
+        self.v_i = self.omega_i = 0.0
+        self.path_x.append(self.x)
+        self.path_y.append(self.y)
 
-    def calculate_voronoi_centroid(self, agents, sensors, field_estimator):
-        """
-        基于 GPR 连续场估计计算 Voronoi 广义质心
-        """
-        agent_positions = np.array([(a.x, a.y) for a in agents])
-        my_idx = self.id
-
-        # 获取 GPR 估计的连续场
-        est_field = field_estimator.estimated_field
-        if est_field is None:
+    def calculate_voronoi_centroid(self, my_points, bar_l_i):
+        if len(my_points) == 0 or bar_l_i <= 1e-8:
             return self.x, self.y
 
-        # 找出属于当前 Agent Voronoi 分区的所有网格点
-        # 为了加速，这里使用步长采样 (例如步长为5)
-        step = 5
-        y_indices = np.arange(0, est_field.shape[0], step)
-        x_indices = np.arange(0, est_field.shape[1], step)
-        xx, yy = np.meshgrid(x_indices, y_indices)
+        d2 = np.sum((my_points - np.array([self.x, self.y])) ** 2, axis=1)
+        l_tilde = 2 * ALPHA * BETA * np.exp(-BETA * d2) * bar_l_i
 
-        # 计算这些采样点到所有 Agent 的距离
-        # 形状: (num_points, num_agents)
-        points = np.vstack([xx.ravel(), yy.ravel()]).T
-        dists = np.sqrt(np.sum((points[:, None, :] - agent_positions[None, :, :]) ** 2, axis=2))
-
-        # 找出距离当前 Agent 最近的点 (即属于我的 Voronoi 分区)
-        nearest_agent_idx = np.argmin(dists, axis=1)
-        my_mask = (nearest_agent_idx == my_idx)
-
-        my_points = points[my_mask]
-        if len(my_points) == 0:
+        W = np.sum(l_tilde)
+        if W < 1e-8:
             return self.x, self.y
 
-        # 获取这些点对应的估计浓度 (质量)
-        my_masses = est_field[my_points[:, 1].astype(int), my_points[:, 0].astype(int)]
+        cx = np.sum(l_tilde * my_points[:, 0]) / W
+        cy = np.sum(l_tilde * my_points[:, 1]) / W
+        return cx, cy
 
-        total_mass = np.sum(my_masses)
-        if total_mass < 0.5:
-            # 质量太小，退化为向全局最高浓度点移动
-            max_idx = np.unravel_index(np.argmax(est_field), est_field.shape)
-            return max_idx[1], max_idx[0]
+    @staticmethod
+    def compute_voronoi_boundaries(agents, env, step=5):
+        pos = np.array([(a.x, a.y) for a in agents])
+        yc = np.arange(0, env.height, step)
+        xc = np.arange(0, env.width, step)
+        xx, yy = np.meshgrid(xc, yc)
+        flat_mask = env.region_mask[yy, xx].ravel()
 
-        # 计算加权质心 (积分近似)
-        target_x = np.sum(my_masses * my_points[:, 0]) / total_mass
-        target_y = np.sum(my_masses * my_points[:, 1]) / total_mass
+        pts = np.column_stack([xx.ravel(), yy.ravel()])[flat_mask]
+        if len(pts) == 0:
+            return []
 
-        return target_x, target_y
+        dists = np.linalg.norm(pts[:, None, :] - pos[None, :, :], axis=2)
+        owners = np.argmin(dists, axis=1)
 
-    @staticmethod  # 静态方法，不依赖self，通过CleaningAgent.compute_voronoi_boundaries()调用
-    def compute_voronoi_boundaries(agents, environment):
-        """
-        计算Voronoi分区边界线段，用于可视化
-        返回线段列表 [(x1,y1,x2,y2), ...]
-        """
-        agent_positions = [(a.x, a.y) for a in agents]  # 收集所有Agent坐标
-        grid = np.zeros((environment.height, environment.width), dtype=int)  # 创建100×100的整数网格，记录每个格子归属哪个Agent
-        step = 1  # 遍历步长，1表示逐格遍历
-        for j in range(0, environment.height, step):  # 遍历每一行
-            for i in range(0, environment.width, step):  # 遍历每一列
-                # 计算格子(i,j)到每个Agent的距离
-                distances = [np.sqrt((i - ax) ** 2 + (j - ay) ** 2) for ax, ay in agent_positions]
-                grid[j, i] = int(np.argmin(distances))  # 格子归属距离最近的Agent，记录编号0/1/2/3
+        lr = -np.ones((len(yc), len(xc)), dtype=int)
+        lr[flat_mask.reshape(len(yc), len(xc))] = owners
 
-        segments = []  # 存放边界线段，每条线段格式(x1,y1,x2,y2)
-        for j in range(environment.height - 1):  # 遍历行（少1行，因为要和下一行比较）
-            for i in range(environment.width - 1):  # 遍历列（少1列，因为要和下一列比较）
-                owner = grid[j, i]  # 当前格子的归属Agent编号
-                # 右边格子归属不同 → 存在垂直边界线
-                if grid[j, i + 1] != owner:
-                    # 垂直线段：在i和i+1之间（x=i+0.5），从j-0.5到j+0.5
-                    segments.append((i + 0.5, j - 0.5, i + 0.5, j + 0.5))
-                # 下方格子归属不同 → 存在水平边界线
-                if grid[j + 1, i] != owner:
-                    # 水平线段：在j和j+1之间（y=j+0.5），从i-0.5到i+0.5
-                    segments.append((i - 0.5, j + 0.5, i + 0.5, j + 0.5))
-        return segments  # 返回所有边界线段，用于画图
+        segs = []
+        for j in range(len(yc) - 1):
+            for i in range(len(xc) - 1):
+                o = lr[j, i]
+                if o < 0:
+                    continue
+                if lr[j, i + 1] >= 0 and lr[j, i + 1] != o:
+                    segs.append((xc[i] + step / 2, yc[j], xc[i] + step / 2, yc[j] + step))
+                if lr[j + 1, i] >= 0 and lr[j + 1, i] != o:
+                    segs.append((xc[i], yc[j] + step / 2, xc[i] + step, yc[j] + step / 2))
+        return segs
 
 
+# ================================================================
+# 7. 多 Agent 仿真主控
+# ================================================================
 class MultiAgentSimulation:
-    """多Agent仿真类：管理环境、传感器、Agent和可视化"""
-    def __init__(self, width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM, n_sources=POLLUTION_SOURCE_NUM):
-        self.width = width  # 仿真区域宽度
-        self.height = height  # 仿真区域高度
-        self.env = PollutionEnvironment(width, height)  # 创建污染环境实例
+    def __init__(self, width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM):
+        self.width, self.height = width, height
+        self.env = PollutionEnvironment(width, height)
+        self.env.init_steady()
 
-        self.sensors = []  # 传感器列表
-        sensor_positions = self._generate_sensor_positions()  # 生成传感器位置，目前位置固定。
-        for i, (x, y) in enumerate(sensor_positions):  # 在每个位置创建传感器
-            self.sensors.append(Sensor(x, y, i))
+        self.sensors = [Sensor(x, y, i) for i, (x, y) in enumerate(self._sensor_positions())]
+        self.agents = [CleaningAgent(x, y, i) for i, (x, y) in enumerate(self._agent_positions(n_agents))]
 
-        self.agents = []  # Agent列表
-        agent_positions = self._generate_agent_positions(n_agents)  # 生成Agent初始位置
-        for i, (x, y) in enumerate(agent_positions):  # 在每个位置创建Agent
-            self.agents.append(CleaningAgent(x, y, i))
+        # ★ 使用高斯基重构器（替代GPR）
+        # 基函数中心：使用传感器位置
+        basis_centers = np.array([[s.x, s.y] for s in self.sensors])
+        self.field_est = GaussianBasisFieldEstimator(
+            centers=basis_centers,
+            sigma_basis=SIGMA_BASIS,
+            lambda_rls=LAMBDA_RLS
+        )
 
-        self._generate_pollution_sources(n_sources)
+        self.J_history = []
+        self.E_history = []
+        self.M_history = []
 
-        self.avg_conc_history = []
-        self.centroid_dist_history = []  # 生成污染源
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 10))
+        self.fig.suptitle('Multi-Agent Pollution Neutralization\n(Distributed Gaussian-Basis Reconstruction)',
+                          fontsize=13, fontweight='bold')
 
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 10))  # 创建2×2子图布局
-        self.fig.suptitle('Multi-Agent Pollution Neutralization System', fontsize=14, fontweight='bold')  # 总标题
-        self.fig.patch.set_facecolor('white')
-
-        # --- 修复：在初始化时创建 twinx 轴 ---
         self.ax4 = self.axes[1, 1]
         self.ax4_r = self.ax4.twinx()
+        self.ax4_r2 = self.ax4.twinx()
+        self.ax4_r2.spines["right"].set_position(("axes", 1.15))
 
-        self.field_estimator = FieldEstimator(length_scale=60.0, noise_level=0.5)
-
-    def _generate_sensor_positions(self):
-        """在11边形边界1/4处、顶点、以及内部每40像素网格上生成传感器"""
-        positions = []
-        # 顶点传感器
-        for vx, vy in POLYGON_VERTICES:
-            positions.append((int(vx), int(vy)))
-        # 每条边的1/4、2/4、3/4处放传感器
+    def _sensor_positions(self):
+        pos = [(int(vx), int(vy)) for vx, vy in POLYGON_VERTICES]
         n = len(POLYGON_VERTICES)
         for i in range(n):
             x1, y1 = POLYGON_VERTICES[i]
             x2, y2 = POLYGON_VERTICES[(i + 1) % n]
-            for j in range(1, 3):
-                t = j / 3
-                x = x1 + t * (x2 - x1)
-                y = y1 + t * (y2 - y1)
-                positions.append((int(x), int(y)))
-        # 内部网格传感器：每80像素一个，仅保留在多边形内部的点
-        for y in range(20, self.height, 80):
-            for x in range(20, self.width, 80):
-                if self.env.region_mask[y, x]:
-                    positions.append((x, y))
-        return positions
+            for t in (1 / 3, 2 / 3):
+                pos.append((int(x1 + t * (x2 - x1)), int(y1 + t * (y2 - y1))))
+        for y in range(30, self.height, 70):
+            for x in range(30, self.width, 70):
+                if POLYGON_PATH.contains_point((x, y)):
+                    pos.append((x, y))
+        return pos
 
-    def _generate_agent_positions(self, n):
-        """生成Agent初始位置"""
-        positions = [(90, 440), (120, 402), (150, 364), (180, 327),
-                     (210, 289), (190, 251), (170, 213), (150, 176),
-                     (130, 138), (110, 100)]
-        return positions
-
-    def _generate_pollution_sources(self, n):
-        """污染源由GMM在diffuse()首次调用时自动生成，此处无需手动添加"""
-        pass
-
-    def _compute_partition_assignments(self):
-        """计算每个传感器属于哪个Agent的Voronoi分区"""
-        agent_positions = [(a.x, a.y) for a in self.agents]
-        assignments = []
-        for sensor in self.sensors:
-            distances = [np.sqrt((sensor.x - ax) ** 2 + (sensor.y - ay) ** 2) for ax, ay in agent_positions]
-            assignments.append(int(np.argmin(distances)))
-        return assignments
+    def _agent_positions(self, n):
+        return [(90, 440), (120, 402), (150, 364), (180, 327),
+                (210, 289), (190, 251), (170, 213), (150, 176),
+                (130, 138), (110, 100)][:n]
 
     def update(self, frame):
-        """每帧更新：扩散→传感器测量→Agent移动并清理→评估指标"""
-        self.env.diffuse()
-        for sensor in self.sensors:
-            sensor.measure(self.env)
+        for s in self.sensors:
+            s.measure(self.env)
 
-        # 每帧（或每隔几帧）更新 GPR 连续场估计
-        if frame % 2 == 0:  # 为了性能，每2帧更新一次GPR
-            self.field_estimator.update_field(self.sensors, self.width, self.height, step=15)
+        positions = [[s.x, s.y] for s in self.sensors]
+        readings = [s.readings[-1] if s.readings else 0.0 for s in self.sensors]
+        for a in self.agents:
+            positions.append([a.x, a.y])
+            readings.append(self.env.get_concentration(a.x, a.y))
 
-        for agent in self.agents:
-            # 传入 field_estimator
-            target_x, target_y = agent.calculate_voronoi_centroid(
-                self.agents, self.sensors, self.field_estimator
-            )
-            agent.move_towards(target_x, target_y, self.env)
-            agent.clean(self.env)
+        if frame % 3 == 0:
+            self.field_est.update_field(positions, readings, self.width, self.height, self.env.region_mask, step=12)
 
-        assignments = self._compute_partition_assignments()
-        total_avg_conc = 0.0
-        total_centroid_dist = 0.0
+        vs = 6
+        yi = np.arange(0, self.height, vs)
+        xi = np.arange(0, self.width, vs)
+        xx, yy = np.meshgrid(xi, yi)
+        vmask = self.env.region_mask[yy, xx]
+        pts = np.column_stack([xx[vmask], yy[vmask]])
+
+        if len(pts) == 0:
+            return frame
+
+        apos = np.array([(a.x, a.y) for a in self.agents])
+        dists = np.linalg.norm(pts[:, None, :] - apos[None, :, :], axis=2)
+        nearest = np.argmin(dists, axis=1)
+
+        J_total = 0.0
+        E_total_frame = 0.0
+
+        est = self.field_est.estimated_field if self.field_est.estimated_field is not None else np.zeros(
+            (self.height, self.width))
+
         for i, agent in enumerate(self.agents):
-            my_sensors = [self.sensors[j] for j, a in enumerate(assignments) if a == i]
-            if my_sensors:
-                avg_conc = np.mean([s.readings[-1] if s.readings else 0 for s in my_sensors] +
-                                   [self.env.get_concentration(agent.x, agent.y)])
-                total_avg_conc += avg_conc
-                total_mass = sum(s.readings[-1] if s.readings else 0 for s in my_sensors)
-                if total_mass > 0.5:
-                    cx = sum((s.readings[-1] if s.readings else 0) * s.x for s in my_sensors) / total_mass
-                    cy = sum((s.readings[-1] if s.readings else 0) * s.y for s in my_sensors) / total_mass
-                else:
-                    cx, cy = agent.x, agent.y
-                total_centroid_dist += np.sqrt((agent.x - cx) ** 2 + (agent.y - cy) ** 2)
+            my_pts = pts[nearest == i]
 
-        self.avg_conc_history.append(total_avg_conc)
-        self.centroid_dist_history.append(total_centroid_dist)
+            if len(my_pts) > 0:
+                ix = np.clip(my_pts[:, 0].astype(int), 0, self.width - 1)
+                iy = np.clip(my_pts[:, 1].astype(int), 0, self.height - 1)
+                cell_concs = est[iy, ix]
+                avg_conc = float(np.mean(cell_concs))
+            else:
+                avg_conc = 0.0
+
+            agent.decide_spray(avg_conc)
+
+            if agent.sigma_i > 0:
+                tx, ty = agent.calculate_voronoi_centroid(my_pts, avg_conc)
+                agent.move_towards(tx, ty, self.env)
+                self.env.apply_additive_spray(agent.x, agent.y, agent.u_i, agent.effective_radius)
+
+                if len(my_pts) > 0:
+                    d2 = np.sum((my_pts - np.array([tx, ty])) ** 2, axis=1)
+                    l_tilde = 2 * ALPHA * BETA * np.exp(-BETA * d2) * avg_conc
+                    weighted_dist = ((my_pts[:, 0] - tx) ** 2 + (my_pts[:, 1] - ty) ** 2) * l_tilde
+                    J_total += float(np.sum(weighted_dist))
+            else:
+                agent.stop()
+
+            E_total_frame += (agent.u_i ** 2) * DT_MOVE
+
+        M_total = float(np.sum(self.env.pollution_grid[self.env.region_mask]))
+
+        self.J_history.append(J_total)
+        self.E_history.append(E_total_frame)
+        self.M_history.append(M_total)
         return frame
 
     def visualize(self, frame):
-        """可视化当前帧：4个子图展示不同信息"""
-        # 11边形闭合边界线坐标
-        polygon_closed = np.vstack([POLYGON_VERTICES, POLYGON_VERTICES[0]])
+        poly_closed = np.vstack([POLYGON_VERTICES, POLYGON_VERTICES[0]])
+        mask = self.env.region_mask
 
-        for ax in [self.axes[0, 0], self.axes[0, 1], self.axes[1, 0]]:
+        for ax in self.axes.ravel()[:3]:
             ax.clear()
             ax.set_xlim(0, self.width)
             ax.set_ylim(0, self.height)
             ax.set_aspect('equal')
             ax.set_facecolor('white')
 
-        # --- 子图1：污染物浓度热力图 ---
+        dg = self.env.pollution_grid.copy()
+        dg[~mask] = np.nan
+
         ax1 = self.axes[0, 0]
-        gamma = 0.3
-        display_grid = np.power(self.env.pollution_grid, gamma)
-        display_grid[~self.env.region_mask] = np.nan
-        vmax_display = np.power(30, gamma)
-        im = ax1.imshow(display_grid, cmap='Blues', origin='lower',
-                        extent=[0, self.width, 0, self.height],
-                        vmin=0, vmax=vmax_display,
-                        alpha=0.95, interpolation='bilinear')
-        ax1.set_title('Pollution Diffusion', color='black')
-        ax1.tick_params(colors='black')
-        ax1.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
+        ax1.imshow(dg, cmap='Blues', origin='lower', extent=[0, self.width, 0, self.height],
+                   vmin=0, vmax=1.2, alpha=0.9, interpolation='bilinear')
+        ax1.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', lw=1.5)
+        ax1.set_title('Pollution Field (Gaussian-Basis Reconstruction)')
 
-        # --- 子图2：Agent位置和路径 ---
         ax2 = self.axes[0, 1]
-        ax2.imshow(display_grid, cmap='Blues', origin='lower',
-                   extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax_display, alpha=0.3,
-                   interpolation='bilinear')
-        ax2.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
+        ax2.imshow(dg, cmap='Blues', origin='lower', extent=[0, self.width, 0, self.height],
+                   vmin=0, vmax=1.2, alpha=0.25, interpolation='bilinear')
+        ax2.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', lw=1.5)
 
-        colors = ['red', 'lime', 'blue', 'orange']
-        voronoi_segments = CleaningAgent.compute_voronoi_boundaries(self.agents, self.env)
-        for x1, y1, x2, y2 in voronoi_segments:
-            ax2.plot([x1, x2], [y1, y2], color='gray', alpha=0.5, linewidth=0.5)
-        for i, agent in enumerate(self.agents):
-            color = colors[i % len(colors)]
-            ax2.plot(agent.path_x[-40:], agent.path_y[-40:], color=color, alpha=0.6, linewidth=1.5)
-            heading = agent.heading
-            size = 10
-            tip = (agent.x + size * np.cos(heading), agent.y + size * np.sin(heading))
-            left = (agent.x + size * 0.6 * np.cos(heading + 2.5), agent.y + size * 0.6 * np.sin(heading + 2.5))
-            right = (agent.x + size * 0.6 * np.cos(heading - 2.5), agent.y + size * 0.6 * np.sin(heading - 2.5))
-            triangle = MplPolygon([tip, left, right], closed=True, facecolor=color, edgecolor='black', linewidth=1.5, zorder=5)
-            ax2.add_patch(triangle)
-            if agent.overspray_on:
-                ax2.scatter([agent.x], [agent.y], c='red', s=8, marker='^', zorder=6)
-            circle = Circle((agent.x, agent.y), agent.effective_radius, fill=False, color=color, linestyle='--',
-                            alpha=0.4, linewidth=1.0)
-            ax2.add_patch(circle)
-        ax2.set_title('Agent Paths and Coverage', color='black')
-        ax2.tick_params(colors='black')
-        ax2.legend([f'Agent {i}' for i in range(len(self.agents))], loc='upper right', fontsize='small',
-                   facecolor='white', labelcolor='black', edgecolor='gray')
-        ax2.grid(True, alpha=0.2, color='gray')
+        for x1, y1, x2, y2 in CleaningAgent.compute_voronoi_boundaries(self.agents, self.env):
+            ax2.plot([x1, x2], [y1, y2], color='darkgray', alpha=0.7, lw=1.0)
 
-        # --- 子图3：传感器位置和读数 ---
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(self.agents), 1)))
+        for i, a in enumerate(self.agents):
+            c = colors[i]
+            ax2.plot(a.path_x[-40:], a.path_y[-40:], color=c, alpha=0.6, lw=1.5)
+            sz = 8
+            tip = (a.x + sz * np.cos(a.heading), a.y + sz * np.sin(a.heading))
+            lf = (a.x + sz * 0.55 * np.cos(a.heading + 2.5), a.y + sz * 0.55 * np.sin(a.heading + 2.5))
+            rt = (a.x + sz * 0.55 * np.cos(a.heading - 2.5), a.y + sz * 0.55 * np.sin(a.heading - 2.5))
+            ax2.add_patch(MplPolygon([tip, lf, rt], closed=True, fc=c, ec='black', lw=1, zorder=5))
+
+            if a.sigma_i > 0:
+                ax2.add_patch(Circle((a.x, a.y), a.effective_radius, fill=False, color=c, ls='--', alpha=0.5, lw=1))
+            else:
+                ax2.plot(a.x, a.y, 'x', color='gray', ms=8, mew=2, zorder=6)
+        ax2.set_title('Agents & Voronoi (× = stopped)')
+
         ax3 = self.axes[1, 0]
-        ax3.imshow(display_grid, cmap='Blues', origin='lower',
-                   extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax_display, alpha=0.3,
-                   interpolation='bilinear')
-        ax3.plot(polygon_closed[:, 0], polygon_closed[:, 1], 'k-', linewidth=1.5)
-        sensor_x = [s.x for s in self.sensors]
-        sensor_y = [s.y for s in self.sensors]
-        sensor_conc = [s.readings[-1] if s.readings else 0 for s in self.sensors]
-        ax3.scatter(sensor_x, sensor_y, c=sensor_conc, cmap='Blues', s=200, marker='^', edgecolors='black', vmin=0,
-                     vmax=100)
-        ax3.set_title('Sensor Readings', color='black')
-        ax3.tick_params(colors='black')
-        for i, sensor in enumerate(self.sensors):
-            ax3.annotate(f'S{i}\n{sensor_conc[i]:.0f}', (sensor.x + 2, sensor.y + 2), fontsize=8, color='black',
-                          fontweight='bold')
-        ax3.grid(True, alpha=0.2, color='gray')
+        ax3.imshow(dg, cmap='Blues', origin='lower', extent=[0, self.width, 0, self.height],
+                   vmin=0, vmax=1.2, alpha=0.25, interpolation='bilinear')
+        ax3.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', lw=1.5)
+        sx = [s.x for s in self.sensors]
+        sy = [s.y for s in self.sensors]
+        sc = [s.readings[-1] if s.readings else 0 for s in self.sensors]
+        ax3.scatter(sx, sy, c=sc, cmap='Reds', s=30, marker='^', edgecolors='black', vmin=0, vmax=0.8, zorder=4)
+        ax3.set_title('Sensor Readings (fixed + onboard)')
 
-        # --- 子图4：评估曲线 ---
-        self.ax4.clear()  # 清空主轴（蓝线）
-        self.ax4_r.clear()  # ★ 清空副轴（橙线），而不是重新 twinx()
-        self.ax4.set_facecolor('white')
+        self.ax4.clear()
+        self.ax4_r.clear()
+        self.ax4_r2.clear()
 
-        frames_x = list(range(len(self.avg_conc_history)))
-        if frames_x:
-            # 蓝线：画在主轴
-            self.ax4.plot(frames_x, self.avg_conc_history,
-                          color='steelblue', linewidth=1.2, label='Avg Conc Sum')
-            # self.ax4.set_ylabel('Avg Concentration Sum', color='steelblue', fontsize=9)
-            self.ax4.tick_params(axis='y', labelcolor='steelblue')
-            self.ax4.tick_params(axis='x', colors='black')
+        fx = list(range(len(self.J_history)))
+        if fx:
+            line1, = self.ax4.plot(fx, self.J_history, color='steelblue', lw=1.5, label='J_total (cost)')
+            self.ax4.set_ylabel('J_total', color='steelblue', fontsize=9)
+            self.ax4.tick_params(axis='y', labelcolor='steelblue', labelsize=8)
 
-            # 橙线：画在已有的副轴上（不再 twinx）
-            self.ax4_r.plot(frames_x, self.centroid_dist_history,
-                            color='orangered', linewidth=1.2, label='Centroid Dist Sum')
-            # self.ax4_r.set_ylabel('Centroid Distance Sum', color='orangered', fontsize=9)
-            self.ax4_r.tick_params(axis='y', labelcolor='orangered')
+            line2, = self.ax4_r.plot(fx, self.E_history, color='orangered', lw=1.5, label='E_frame (energy)')
+            self.ax4_r.set_ylabel('E_frame', color='orangered', fontsize=9)
+            self.ax4_r.tick_params(axis='y', labelcolor='orangered', labelsize=8)
 
-            # 合并两个轴的图例
-            lines1, labels1 = self.ax4.get_legend_handles_labels()
-            lines2, labels2 = self.ax4_r.get_legend_handles_labels()
-            self.ax4.legend(lines1 + lines2, labels1 + labels2,
-                            loc='upper right', fontsize=8,
-                            facecolor='white', labelcolor='black', edgecolor='gray')
+            line3, = self.ax4_r2.plot(fx, self.M_history, color='forestgreen', lw=1.5, label='M_total (mass)')
+            self.ax4_r2.set_ylabel('M_total', color='forestgreen', fontsize=9)
+            self.ax4_r2.tick_params(axis='y', labelcolor='forestgreen', labelsize=8)
 
-        self.ax4.set_title('Evaluation Metrics', color='black', fontsize=10)
-        self.ax4.set_xlabel('Frame', color='black', fontsize=9)
-        self.ax4.grid(True, alpha=0.2, color='gray')
+            lines = [line1, line2, line3]
+            labels = [l.get_label() for l in lines]
+            self.ax4.legend(lines, labels, loc='upper right', fontsize=8)
 
-    def save_gpr_snapshot(self, save_path='gpr_reconstruction.png'):
-        """使用当前传感器读数进行GPR场估计，并保存对比图到本地"""
-        print("\n正在准备 GPR 场还原图片...")
+        self.ax4.set_title('Evaluation Metrics (Paper Eq.18, 23)', fontsize=10)
+        self.ax4.set_xlabel('Frame', fontsize=9)
+        self.ax4.grid(True, alpha=0.2)
 
-        # 1. 收集当前所有传感器的位置和读数
-        sensor_x = [s.x for s in self.sensors]
-        sensor_y = [s.y for s in self.sensors]
-        sensor_readings = [s.readings[-1] if s.readings else 0 for s in self.sensors]
-
-        X_train = np.vstack((sensor_x, sensor_y)).T
-        y_train = np.array(sensor_readings)
-
-        if np.max(y_train) < 1e-5:
-            print("传感器读数全为0，跳过GPR估计。")
-            return
-
-        # 2. 配置并训练 GPR 模型
-        # length_scale 控制平滑度，alpha 控制对噪声的容忍度
-        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=40.0, length_scale_bounds=(1e-1, 1e3))
-        gpr = GaussianProcessRegressor(kernel=kernel, alpha=0.5, normalize_y=True)
-        gpr.fit(X_train, y_train)
-
-        # 3. 降采样预测全场 (步长设为4，即预测 150x150 的网格，大幅提速)
-        step = 4
-        y_grid, x_grid = np.mgrid[0:self.height:step, 0:self.width:step]
-        X_test = np.vstack((x_grid.ravel(), y_grid.ravel())).T
-
-        print("正在预测全场 (GPR)，请稍候...")
-        y_pred = gpr.predict(X_test)
-        gpr_field_low = y_pred.reshape(x_grid.shape)
-
-        # 4. 获取真实场并计算低分辨率下的误差
-        true_field = self.env.pollution_grid
-        true_field_low = true_field[0:self.height:step, 0:self.width:step]
-        error_field = np.abs(true_field_low - gpr_field_low)
-
-        # 5. 绘制 1行3列 的对比图
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle('Gaussian Process Regression: Field Reconstruction', fontsize=16, fontweight='bold')
-
-        vmax = np.max(true_field)  # 统一颜色映射的最大值
-
-        # 子图1：真实污染场
-        im1 = axes[0].imshow(true_field, cmap='Blues', origin='lower',
-                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax, interpolation='bilinear')
-        axes[0].scatter(sensor_x, sensor_y, c='red', s=20, marker='^', edgecolors='black', label='Sensors')
-        axes[0].set_title('True Pollution Field')
-        axes[0].set_aspect('equal')
-        plt.colorbar(im1, ax=axes[0])
-
-        # 子图2：GPR 估计场 (利用 extent 和 interpolation 自动平滑放大)
-        im2 = axes[1].imshow(gpr_field_low, cmap='Blues', origin='lower',
-                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax, interpolation='bilinear')
-        axes[1].scatter(sensor_x, sensor_y, c='red', s=20, marker='^', edgecolors='black')
-        axes[1].set_title('GPR Estimated Field')
-        axes[1].set_aspect('equal')
-        plt.colorbar(im2, ax=axes[1])
-
-        # 子图3：绝对误差场
-        im3 = axes[2].imshow(error_field, cmap='hot_r', origin='lower',
-                             extent=[0, self.width, 0, self.height], vmin=0, vmax=vmax * 0.2, interpolation='bilinear')
-        axes[2].scatter(sensor_x, sensor_y, c='cyan', s=20, marker='^', edgecolors='black')
-        axes[2].set_title('Absolute Estimation Error')
-        axes[2].set_aspect('equal')
-        plt.colorbar(im3, ax=axes[2])
-
+    def run(self, frames=200, interval=80, save_gif=False, gif_filename='pollution_neutralization.gif'):
+        ani = FuncAnimation(self.fig, lambda f: self.visualize(self.update(f)),
+                            frames=frames, interval=interval, blit=False, repeat=False)
         plt.tight_layout()
-        # 保存高清图片
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ GPR 场还原图片已保存至: {save_path}")
-        plt.close(fig)  # 关闭图片释放内存
 
-    def run(self, frames=200, interval=100, save_gif=False):
-        """运行仿真：生成动画并显示或保存为GIF"""
-        ani = FuncAnimation(self.fig, lambda frame: self.visualize(self.update(frame)),  # 每帧先update再visualize
-                             frames=frames, interval=interval, blit=False, repeat=False)  # 总帧数、帧间隔、不使用blit、不循环
-        plt.tight_layout()  # 自动调整子图间距
-
-        if save_gif:  # 保存为GIF
-            print("正在保存 GIF，请稍候... (由于插值算法，保存可能需要几分钟)")
-            ani.save('pollution_diffusion.gif', writer='pillow', fps=10)  # 使用pillow写入器，10帧/秒
-            print("✓ GIF 已保存！")
-        else:  # 直接显示动画
+        if save_gif:
+            print(f"正在保存 GIF → {gif_filename} ...")
+            try:
+                ani.save(gif_filename, writer='pillow', fps=10)
+                print(f"✓ GIF 已保存: {gif_filename}")
+            except Exception as e:
+                print(f"✗ 保存失败: {e}\n  请运行 pip install pillow")
+        else:
             plt.show()
-        return ani  # 返回动画对象
+        return ani
 
 
 if __name__ == "__main__":
-    sim = MultiAgentSimulation(width=WIDTH, height=HEIGHT, n_agents=AGENTS_NUM, n_sources=POLLUTION_SOURCE_NUM)
-    ani = sim.run(frames=150, interval=80, save_gif=True)
-
-    # 在仿真结束后（此时传感器已经有了丰富的历史读数），保存 GPR 场还原图片
-    # sim.save_gpr_snapshot('gpr_reconstruction.png')
+    sim = MultiAgentSimulation(WIDTH, HEIGHT, AGENTS_NUM)
+    ani = sim.run(frames=200, interval=60, save_gif=True, gif_filename='pollution_neutralization.gif')
