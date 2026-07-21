@@ -34,5 +34,5 @@ python pollution_monitoring.py
 
 
 <p align="center">
-  <img src="pollution_diffusion_2.gif" alt="污染清理仿真预览" width="800">
+  <img src="pollution_neutralization.gif" alt="污染清理仿真预览" width="800">
 </p>
